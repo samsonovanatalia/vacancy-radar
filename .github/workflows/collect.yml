@@ -35,14 +35,15 @@ jobs:
       - name: Собрать вакансии
         run: python -m collectors.arbeitnow
 
-      # Шаг ниже включим, когда появится проект в Google Cloud.
-      # Ключ кладётся в Settings → Secrets and variables → Actions,
+      # Ключ лежит в Settings → Secrets and variables → Actions,
       # в коде он никогда не появляется.
-      #
-      # - name: Загрузить в BigQuery
-      #   env:
-      #     BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
-      #     GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
-      #   run: |
-      #     echo '${{ secrets.GCP_SA_KEY }}' > key.json
-      #     python -m load.to_bigquery
+      - name: Загрузить в BigQuery
+        env:
+          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+        run: |
+          # printf '%s' безопаснее echo: не ломается на кавычках внутри ключа
+          # и не разворачивает escape-последовательности.
+          printf '%s' "$GCP_SA_KEY" > key.json
+          python -m load.to_bigquery

@@ -2,6 +2,7 @@
 .env
 *.json.key
 service-account*.json
+key.json
 
 # Виртуальное окружение Python.
 .venv/
