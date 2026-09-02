@@ -1,0 +1,23 @@
+# Секреты — никогда в репозиторий.
+.env
+*.json.key
+service-account*.json
+
+# Виртуальное окружение Python.
+.venv/
+__pycache__/
+*.pyc
+
+# Собранные данные: они пересобираются, в git им не место.
+data/*.jsonl
+data/*.duckdb
+!data/.gitkeep
+
+# Служебные файлы dbt.
+dbt_radar/target/
+dbt_radar/dbt_packages/
+dbt_radar/logs/
+profiles.yml
+
+# Системное.
+.DS_Store

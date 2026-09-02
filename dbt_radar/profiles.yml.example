@@ -1,0 +1,18 @@
+# Файл подключения dbt к базе. Настоящий profiles.yml лежит НЕ в проекте,
+# а в домашней папке (~/.dbt/profiles.yml) — именно поэтому в нём можно
+# держать путь к ключу, и он никогда не попадёт в git.
+#
+# Этот файл — образец. Скопируйте его в ~/.dbt/profiles.yml и подставьте свои значения.
+
+vacancy_radar:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: service-account          # авторизация по файлу-ключу
+      project: ЗАМЕНИТЬ_НА_ID_ПРОЕКТА  # id проекта в Google Cloud
+      dataset: dbt_natalia             # куда dbt будет складывать свои таблицы
+      keyfile: /полный/путь/к/ключу.json
+      location: EU                     # регион хранения данных
+      threads: 4                       # сколько моделей считать параллельно
+      timeout_seconds: 300

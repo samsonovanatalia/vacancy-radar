@@ -1,0 +1,48 @@
+# Запуск сбора вакансий по расписанию — то, что заменяет нам сервер с Airflow.
+# Включим на первой неделе, когда коллектор заработает локально.
+#
+# Как читать этот файл:
+#   on       — когда запускать
+#   jobs     — что запускать
+#   steps    — по шагам, сверху вниз, как в терминале
+
+name: collect
+
+on:
+  # cron в UTC. 06:00 UTC = 08:00 в Барселоне летом.
+  # Формат: минута час день месяц день_недели
+  schedule:
+    - cron: "0 6 * * *"
+  # Позволяет запустить вручную кнопкой на вкладке Actions — удобно для отладки.
+  workflow_dispatch:
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Забрать код репозитория
+        uses: actions/checkout@v4
+
+      - name: Поставить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Установить зависимости
+        run: pip install -r requirements.txt
+
+      - name: Собрать вакансии
+        run: python -m collectors.arbeitnow
+
+      # Шаг ниже включим, когда появится проект в Google Cloud.
+      # Ключ кладётся в Settings → Secrets and variables → Actions,
+      # в коде он никогда не появляется.
+      #
+      # - name: Загрузить в BigQuery
+      #   env:
+      #     BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+      #     GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+      #   run: |
+      #     echo '${{ secrets.GCP_SA_KEY }}' > key.json
+      #     python -m load.to_bigquery

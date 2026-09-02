@@ -1,0 +1,31 @@
+# Главный файл настроек dbt-проекта.
+# Читается автоматически при каждой команде dbt.
+# Включаем это на второй неделе — сейчас файл лежит для ознакомления.
+
+name: 'vacancy_radar'
+version: '0.1.0'
+profile: 'vacancy_radar'      # ссылка на профиль подключения из ~/.dbt/profiles.yml
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+
+# Куда dbt складывает служебные файлы. В git они не нужны (см. .gitignore).
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  vacancy_radar:
+    staging:
+      # +materialized: view означает "не создавать физическую таблицу,
+      # а сохранить запрос как представление". Для лёгкого слоя staging
+      # это дешевле: данные не дублируются, а пересчитываются при обращении.
+      +materialized: view
+      +schema: staging
+    marts:
+      # Витрины наоборот делаем таблицами: они читаются дашбордом много раз,
+      # и пересчитывать их каждый раз дорого.
+      +materialized: table
+      +schema: marts

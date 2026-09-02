@@ -1,0 +1,24 @@
+version: 2
+
+models:
+  - name: mart_skill_demand
+    description: >
+      Спрос на навыки по неделям. Одна строка = одна неделя × один навык.
+      Считается по упоминанию навыка в тексте вакансии.
+    columns:
+      - name: week
+        tests:
+          - not_null
+      - name: skill
+        tests:
+          - not_null
+      - name: vacancies_count
+        description: "Число уникальных вакансий с этим навыком за неделю."
+        # Пример теста с условием: значение должно быть больше нуля.
+        # Он требует пакет dbt_utils — подключим его на второй неделе через
+        # packages.yml, тогда и раскомментируем. Сейчас строки выключены,
+        # чтобы `dbt build` не падал из-за отсутствующего пакета.
+        # tests:
+        #   - dbt_utils.accepted_range:
+        #       min_value: 1
+        #       inclusive: true
