@@ -3,7 +3,7 @@ requests==2.32.3
 
 # Шаг 2 и дальше — раскомментируйте, когда дойдём до них.
 # duckdb==1.1.3                      # маленькая база на своём компьютере, для отладки SQL
-# google-cloud-bigquery==3.27.0      # загрузка данных в BigQuery
+google-cloud-bigquery==3.27.0      # загрузка данных в BigQuery
 # dbt-bigquery==1.9.0                # dbt для BigQuery
 # dlt[bigquery]==1.5.0               # библиотека загрузки для остальных источников
 # google-genai==0.8.0                # обращение к модели Gemini
