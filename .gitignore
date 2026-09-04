@@ -3,6 +3,7 @@
 *.json.key
 service-account*.json
 key.json
+set-env.ps1
 
 # Виртуальное окружение Python.
 .venv/
