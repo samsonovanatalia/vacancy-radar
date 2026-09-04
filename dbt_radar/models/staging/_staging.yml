@@ -26,7 +26,8 @@ models:
           - accepted_values:
               # Список разрешённых значений. Если завтра появится источник,
               # о котором мы не знаем, тест упадёт — и это правильно.
-              values: ['arbeitnow', 'adzuna', 'remoteok', 'telegram']
+              arguments:
+                values: ['arbeitnow', 'adzuna', 'remoteok', 'telegram']
 
       - name: title
         tests:

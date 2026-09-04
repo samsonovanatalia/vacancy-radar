@@ -17,10 +17,11 @@ sources:
     # freshness: если самая свежая строка старше 36 часов — предупредить,
     # старше 72 часов — уронить с ошибкой. Так мы узнаем, что утренний сбор
     # сломался, до того как увидим пустой дашборд.
-    freshness:
-      warn_after: {count: 36, period: hour}
-      error_after: {count: 72, period: hour}
-    loaded_at_field: ingested_at
+    config:
+      freshness:
+        warn_after: {count: 36, period: hour}
+        error_after: {count: 72, period: hour}
+      loaded_at_field: ingested_at
 
     tables:
       - name: arbeitnow
