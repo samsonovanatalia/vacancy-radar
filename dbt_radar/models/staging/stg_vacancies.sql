@@ -6,7 +6,7 @@
 --   {{ source('raw', 'arbeitnow') }} — ссылка на источник вместо имени таблицы.
 --   Благодаря ей dbt строит граф зависимостей автоматически.
 
-with source as (
+with source_data as (
 
     select * from {{ source('raw', 'arbeitnow') }}
 
@@ -39,7 +39,7 @@ cleaned as (
         timestamp_seconds(created_at_unix)          as posted_at,
         cast(ingested_at as timestamp)              as ingested_at
 
-    from source
+    from source_data
 
     -- Мусорные строки без заголовка нам не нужны нигде дальше.
     where title is not null
