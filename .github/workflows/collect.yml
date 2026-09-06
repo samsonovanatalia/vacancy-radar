@@ -32,12 +32,15 @@ jobs:
       - name: Установить зависимости
         run: pip install -r requirements.txt
 
-      - name: Собрать вакансии
+      - name: Собрать вакансии (arbeitnow)
         run: python -m collectors.arbeitnow
+
+      - name: Собрать вакансии (remoteok)
+        run: python -m collectors.remoteok
 
       # Ключ лежит в Settings → Secrets and variables → Actions,
       # в коде он никогда не появляется.
-      - name: Загрузить в BigQuery
+      - name: Загрузить arbeitnow в BigQuery
         env:
           BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -46,4 +49,13 @@ jobs:
           # printf '%s' безопаснее echo: не ломается на кавычках внутри ключа
           # и не разворачивает escape-последовательности.
           printf '%s' "$GCP_SA_KEY" > key.json
-          python -m load.to_bigquery
+          python -m load.to_bigquery arbeitnow
+
+      # key.json уже лежит в рабочей папке после предыдущего шага —
+      # секрет второй раз разворачивать не нужно. А вот env задаётся
+      # для каждого шага отдельно, он не наследуется.
+      - name: Загрузить remoteok в BigQuery
+        env:
+          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+        run: python -m load.to_bigquery remoteok

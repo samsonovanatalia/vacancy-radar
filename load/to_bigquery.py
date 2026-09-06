@@ -6,35 +6,49 @@
 Читать его полезно уже сейчас: видно, что «загрузка в облако» — это
 двадцать строк, а не отдельная профессия.
 
+Скрипт не привязан к одному источнику: имя источника передаётся первым
+аргументом командной строки, по умолчанию arbeitnow.
+
 Что произойдёт при запуске:
-  1. Библиотека прочитает файл data/raw_arbeitnow.jsonl.
-  2. Создаст (если ещё нет) датасет raw и таблицу arbeitnow.
+  1. Библиотека прочитает файл data/raw_<источник>.jsonl.
+  2. Создаст (если ещё нет) датасет raw и таблицу <источник>.
   3. Допишет строки в таблицу, не стирая старые.
 
 Перед запуском:
     pip install google-cloud-bigquery
     export GOOGLE_APPLICATION_CREDENTIALS=/путь/к/ключу.json
     export BQ_PROJECT=ваш-project-id
+
+Как запустить:
+    python -m load.to_bigquery              # arbeitnow, значение по умолчанию
+    python -m load.to_bigquery remoteok     # любой другой источник
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 # Импорт намеренно внутри функции: пока пакет не установлен,
 # файл всё равно можно открыть и прочитать, не получив ошибку.
 
-DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "raw_arbeitnow.jsonl"
+DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 DATASET = "raw"
-TABLE = "arbeitnow"
+DEFAULT_SOURCE = "arbeitnow"
 
 
-def load() -> None:
+def load(source: str = DEFAULT_SOURCE) -> None:
+    """Заливает data/raw_<source>.jsonl в таблицу raw.<source>."""
     from google.cloud import bigquery
+
+    # Всё, что зависит от источника, выводится из его имени: путь к файлу
+    # и имя таблицы. Остальная логика загрузки одна на все источники.
+    data_path = DATA_DIR / f"raw_{source}.jsonl"
 
     project = os.environ["BQ_PROJECT"]        # упадёт с понятной ошибкой, если не задан
     client = bigquery.Client(project=project)
+    table_id = f"{project}.{DATASET}.{source}"
 
     # Датасет — это папка для таблиц. Создаём, если её ещё нет.
     dataset_ref = bigquery.Dataset(f"{project}.{DATASET}")
@@ -54,16 +68,16 @@ def load() -> None:
         time_partitioning=bigquery.TimePartitioning(field="ingested_at"),
     )
 
-    with DATA_PATH.open("rb") as f:
-        job = client.load_table_from_file(
-            f, f"{project}.{DATASET}.{TABLE}", job_config=job_config
-        )
+    with data_path.open("rb") as f:
+        job = client.load_table_from_file(f, table_id, job_config=job_config)
 
     job.result()   # ждём окончания загрузки; если упало — увидим ошибку здесь
 
-    table = client.get_table(f"{project}.{DATASET}.{TABLE}")
-    print(f"в таблице теперь {table.num_rows} строк")
+    table = client.get_table(table_id)
+    print(f"в таблице {DATASET}.{source} теперь {table.num_rows} строк")
 
 
 if __name__ == "__main__":
-    load()
+    # sys.argv[0] — имя самого скрипта, поэтому источник берём из sys.argv[1].
+    source_name = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SOURCE
+    load(source_name)
