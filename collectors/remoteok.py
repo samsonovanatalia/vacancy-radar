@@ -57,7 +57,13 @@ def normalize(job: dict) -> dict:
     """Приводит одну вакансию RemoteOK к нашему единому виду."""
     return {
         "source": "remoteok",
-        "source_id": job.get("id"),
+        # RemoteOK отдаёт id то числом, то строкой в кавычках. Если пустить
+        # это как есть, автодетект схемы в BigQuery выберет тип по первой
+        # загрузке — и в raw окажется int64 там, где у других источников
+        # строка. Фиксируем тип здесь, на входе. Ключ берём по [], а не
+        # .get(): вакансии без id отсеяны в fetch_all, и если такая всё же
+        # дойдёт сюда — пусть скрипт упадёт, а не запишет "None".
+        "source_id": str(job["id"]),
         "title": job.get("position"),          # какое поле у RemoteOK?
         "company_name": job.get("company"),   # и здесь
         "location": job.get("location"),

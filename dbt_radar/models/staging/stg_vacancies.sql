@@ -15,7 +15,12 @@ with arbeitnow as (
 
     select
         source,
-        source_id,
+
+        -- source_id у arbeitnow — это slug, строка. У remoteok в raw лежит
+        -- число (см. комментарий в блоке remoteok ниже). Приводим обе ветки
+        -- к string явно, чтобы union all сходился по типам.
+        cast(source_id as string)                   as source_id,
+
         title,
         company_name,
         location,
@@ -42,7 +47,12 @@ remoteok as (
 
     select
         source,
-        source_id,
+
+        -- В raw.remoteok эта колонка имеет тип int64: API отдаёт id то числом,
+        -- то строкой, а схему таблицы BigQuery определил автоматически по
+        -- первой загрузке. Раз raw мы не переписываем, чиним типы здесь.
+        cast(source_id as string)                   as source_id,
+
         title,
         company_name,
         location,
