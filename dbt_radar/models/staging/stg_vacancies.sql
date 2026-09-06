@@ -44,6 +44,18 @@ cleaned as (
     -- Мусорные строки без заголовка нам не нужны нигде дальше.
     where title is not null
 
+),
+
+deduplicated as (
+
+    select *
+    from cleaned
+    qualify row_number() over (
+        partition by vacancy_key
+        order by ingested_at desc
+    ) = 1
+
 )
 
-select * from cleaned
+select * from deduplicated
+
