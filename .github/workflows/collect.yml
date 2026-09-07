@@ -59,3 +59,23 @@ jobs:
           BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
         run: python -m load.to_bigquery remoteok
+
+      # dbt стоит из requirements.txt (dbt-bigquery==1.12.0) — отдельно
+      # ставить не нужно, иначе версия окажется прописана в двух местах.
+      #
+      # --project-dir  — где лежит dbt_project.yml и папка models
+      # --profiles-dir — где лежит profiles.yml с подключением к BigQuery
+      # По умолчанию dbt ищет профиль в ~/.dbt/ — на раннере такой папки нет,
+      # поэтому показываем ему нашу.
+      #
+      # build = run + test: сначала пересобирает модель, сразу проверяет её
+      # тестами и только потом идёт к следующей. Если тест упал — дальше
+      # по цепочке не пойдёт, и битые данные не доедут до marts.
+      - name: Пересчитать модели dbt
+        env:
+          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+        run: |
+          dbt build \
+            --project-dir dbt_radar \
+            --profiles-dir dbt_radar

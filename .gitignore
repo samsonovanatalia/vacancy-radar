@@ -19,7 +19,6 @@ data/*.duckdb
 dbt_radar/target/
 dbt_radar/dbt_packages/
 dbt_radar/logs/
-profiles.yml
 
 # Системное.
 .DS_Store

@@ -1,0 +1,12 @@
+vacancy_radar:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: service-account
+      project: "{{ env_var('BQ_PROJECT') }}"
+      keyfile: "{{ env_var('GOOGLE_APPLICATION_CREDENTIALS') }}"
+      dataset: dbt_natalia
+      location: EU
+      threads: 4
+      timeout_seconds: 300
