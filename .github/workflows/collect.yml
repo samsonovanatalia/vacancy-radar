@@ -38,6 +38,23 @@ jobs:
       - name: Собрать вакансии (remoteok)
         run: python -m collectors.remoteok
 
+      # У adzuna, в отличие от остальных, есть ключи. Они лежат в
+      # Settings → Secrets and variables → Actions и подставляются
+      # только на время шага: в логах вместо значения будет ***.
+      - name: Собрать вакансии (adzuna)
+        env:
+          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+        run: python -m collectors.adzuna
+
+      # remotive отключён: публичный API отдаёт всего 17 вакансий на весь рынок
+      # и игнорирует параметр category, ни одной data-вакансии в выдаче нет.
+      # Код коллектора и таблица в BigQuery остаются — если API починят,
+      # достаточно вернуть сюда два шага.
+      #
+      # - name: Собрать вакансии (remotive)
+      #   run: python -m collectors.remotive
+
       # Ключ лежит в Settings → Secrets and variables → Actions,
       # в коде он никогда не появляется.
       - name: Загрузить arbeitnow в BigQuery
@@ -59,6 +76,20 @@ jobs:
           BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
         run: python -m load.to_bigquery remoteok
+
+      # Ключи Adzuna здесь уже не нужны: загрузчик читает готовый файл
+      # data/raw_adzuna.jsonl и в источник не ходит.
+      - name: Загрузить adzuna в BigQuery
+        env:
+          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+        run: python -m load.to_bigquery adzuna
+
+      # - name: Загрузить remotive в BigQuery
+      #   env:
+      #     BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+      #     GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+      #   run: python -m load.to_bigquery remotive
 
       # dbt стоит из requirements.txt (dbt-bigquery==1.12.0) — отдельно
       # ставить не нужно, иначе версия окажется прописана в двух местах.
