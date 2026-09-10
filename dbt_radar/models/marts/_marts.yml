@@ -56,8 +56,9 @@ models:
         description: "lead / senior / junior / mid — по заголовку. lead и junior исключаются."
       - name: is_english
         description: >
-          false, если английских служебных слов меньше 3 на 100 слов в первых
-          2000 символах описания или в заголовке есть (m/w/d), (m/f/d), (w/m/d).
+          false, если английских служебных слов меньше 5 на 100 слов в первых
+          2000 символах чистого описания (description_clean) или в заголовке
+          есть (m/w/d), (m/f/d), (w/m/d).
       - name: location_fit
         description: "spain / remote / other — по location и is_remote. Только для балла, не исключает."
       - name: is_agency
