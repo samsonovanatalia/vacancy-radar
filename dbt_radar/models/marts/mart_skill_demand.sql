@@ -38,7 +38,10 @@ matched as (
         v.vacancy_key
     from vacancies as v
     cross join skills as s
-    where lower(v.description) like concat('%', s.skill, '%')
+    -- Ищем по description_clean, а не по description: в сыром описании
+    -- arbeitnow — HTML, и навык находился даже в разметке. Например, «dbt»
+    -- внутри картинки, вшитой в тег <img> строкой base64.
+    where lower(v.description_clean) like concat('%', s.skill, '%')
 
 )
 

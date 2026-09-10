@@ -275,6 +275,8 @@ select
     tags,
     job_types,
     description,
+    -- Чистое описание из staging. Его читает скрипт обогащения.
+    description_clean,
 
     role_type,
     seniority,

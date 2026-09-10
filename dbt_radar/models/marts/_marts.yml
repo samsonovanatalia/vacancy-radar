@@ -50,6 +50,8 @@ models:
         description: >
           Ядро заголовка для дедупа: без начальной скобки, обрезано до первого
           разделителя (дефис с пробелом, –, —, |, запятая, «(»), нижний регистр.
+      - name: description_clean
+        description: "Описание без HTML из stg_vacancies. Его отправляет в модель enrich/with_gemini.py."
       - name: seniority
         description: "lead / senior / junior / mid — по заголовку. lead и junior исключаются."
       - name: is_english

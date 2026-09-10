@@ -55,7 +55,11 @@ MARTS_DATASET = "dbt_natalia_marts"
 RAW_DATASET = "raw"
 TABLE_NAME = "llm_enrichment"
 
-MAX_DESCRIPTION_CHARS = 6000
+# Сколько символов очищенного описания отправляем в модель: начало и конец.
+# В начале обычно суть роли и требования, в конце — условия, город, зарплата,
+# требование к визе. Середина (о компании, ценности) нужна модели меньше всего.
+HEAD_CHARS = 12_000
+TAIL_CHARS = 8_000
 
 # Лимит бесплатного ключа для gemini-3.6-flash — 5 запросов в минуту:
 # ровно по лимиту это 60 / 5 = 12 секунд между запросами. Берём 14 — с
@@ -274,8 +278,8 @@ def fetch_candidates(bq: bigquery.Client, project: str, limit: int) -> list[dict
     # в llm_enrichment». Альтернатива not in (select vacancy_key ...) опасна:
     # если в подзапросе окажется хоть один null, not in не вернёт ничего.
     #
-    # Описание обрезаем прямо в SQL: нет смысла тащить по сети текст,
-    # который всё равно не отправим в модель.
+    # Описание берём уже очищенное — его чистит dbt в stg_vacancies — и
+    # целиком: под размер запроса к модели его обрезает shorten.
     #
     # Подставлять значения через f-строку здесь безопасно: имена — наши
     # константы, а limit read_limit уже превратил в int.
@@ -283,7 +287,7 @@ def fetch_candidates(bq: bigquery.Client, project: str, limit: int) -> list[dict
         select
             s.vacancy_key,
             s.title,
-            substr(s.description, 1, {MAX_DESCRIPTION_CHARS}) as description
+            s.description_clean
         from `{project}.{MARTS_DATASET}.mart_vacancies_scored` as s
         where s.excluded_reason is null
           and not exists (
@@ -295,6 +299,13 @@ def fetch_candidates(bq: bigquery.Client, project: str, limit: int) -> list[dict
         limit {limit}
     """
     return [dict(row) for row in bq.query(query).result()]
+
+
+def shorten(text: str) -> str:
+    """Оставляет первые HEAD_CHARS и последние TAIL_CHARS символов, между ними [...]."""
+    if len(text) <= HEAD_CHARS + TAIL_CHARS:
+        return text
+    return f"{text[:HEAD_CHARS]}\n[...]\n{text[-TAIL_CHARS:]}"
 
 
 def ask_gemini(client: genai.Client, title: str, description: str | None) -> dict:
@@ -448,8 +459,10 @@ def enrich(limit: int) -> None:
         for number, vacancy in enumerate(candidates, start=1):
             key = vacancy["vacancy_key"]
             progress = f"{number}/{len(candidates)} {key}"
+            # or "": description_clean — null, если у вакансии нет описания.
+            description = shorten(vacancy["description_clean"] or "")
             try:
-                answer = ask_with_retries(client, vacancy["title"], vacancy["description"])
+                answer = ask_with_retries(client, vacancy["title"], description)
             except (BadAnswer, RateLimited) as problem:
                 skipped += 1
                 print(f"{progress} пропущена: {problem}", flush=True)

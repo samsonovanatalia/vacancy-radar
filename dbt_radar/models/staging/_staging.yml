@@ -33,6 +33,16 @@ models:
         tests:
           - not_null
 
+      - name: description
+        description: "Описание как пришло из источника. У arbeitnow и части других — HTML."
+
+      - name: description_clean
+        description: >
+          Описание без HTML-тегов и сущностей, со схлопнутыми пробелами и
+          без рекламного хвоста arbeitnow. По нему ищутся навыки, и его
+          получает языковая модель. Что чистка сработала, проверяет тест
+          tests/assert_description_clean_has_no_html.sql.
+
       - name: posted_at
         description: "Когда вакансия опубликована в источнике."
 
