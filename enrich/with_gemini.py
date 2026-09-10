@@ -22,6 +22,7 @@ in our Berlin office» пишут сотней способов. Регуляр�
     export BQ_PROJECT=ваш-project-id
     export GOOGLE_APPLICATION_CREDENTIALS=/путь/к/ключу.json
     export GEMINI_API_KEY=ключ-из-ai-studio
+    export GEMINI_MODEL=gemini-3.5-flash-lite   # необязательно, см. MODEL_NAME
 
 Как запустить (из папки проекта):
     python -m enrich.with_gemini        # все кандидаты, но не больше MAX_PER_RUN
@@ -41,7 +42,12 @@ from google import genai
 from google.cloud import bigquery
 from google.genai import errors, types
 
-MODEL_NAME = "gemini-3.6-flash"
+# Модель меняется без правки кода: GEMINI_MODEL=gemini-3.5-flash-lite.
+# Имя модели пишется в каждую строку таблицы (model_name), так что в данных
+# всегда видно, какой моделью получен ответ.
+# `or`, а не второй аргумент get: в GitHub Actions незаданная переменная
+# приходит пустой строкой, и get("GEMINI_MODEL", "...") вернул бы "".
+MODEL_NAME = os.environ.get("GEMINI_MODEL") or "gemini-3.6-flash"
 
 # Витрину dbt кладёт в датасет <dataset из profiles.yml>_<schema из
 # dbt_project.yml>: dbt_natalia + marts = dbt_natalia_marts.
@@ -51,11 +57,18 @@ TABLE_NAME = "llm_enrichment"
 
 MAX_DESCRIPTION_CHARS = 6000
 
-# Лимит бесплатного ключа — 15 запросов в минуту: 60 / 15 = 4 секунды
-# между запросами. Сам запрос тоже идёт несколько секунд, так что реальный
-# темп получится ниже лимита. Поменялся лимит — меняем одно число.
-REQUESTS_PER_MINUTE = 15
-PAUSE_SECONDS = 60 / REQUESTS_PER_MINUTE
+# Лимит бесплатного ключа для gemini-3.6-flash — 5 запросов в минуту:
+# ровно по лимиту это 60 / 5 = 12 секунд между запросами. Берём 14 — с
+# запасом: счётчик на стороне Google и наши часы могут разойтись на
+# секунду-другую, и при паузе впритык шестой запрос попадёт в ту же минуту.
+PAUSE_SECONDS = 14
+
+# Сколько раз пробуем одну вакансию, упираясь в 429, считая первую попытку.
+RATE_LIMIT_ATTEMPTS = 3
+
+# Сколько ждать, если в ответе 429 не нашлось рекомендованной задержки.
+# Лимит поминутный, так что минуты хватит наверняка.
+DEFAULT_RETRY_SECONDS = 60
 
 # Таймаут на одну попытку запроса к модели. HttpOptions принимает его
 # в миллисекундах, поэтому 60 секунд — это 60_000. Без него SDK ждёт ответа
@@ -65,6 +78,12 @@ REQUEST_TIMEOUT_MS = 60_000
 
 # Попыток всего, считая первую: один запрос и не больше двух повторов.
 REQUEST_ATTEMPTS = 3
+
+# На каких кодах повторяет сам SDK. Это его список по умолчанию, но без 429:
+# SDK повторяет через 1, 2, 4 секунды и не смотрит на рекомендованную
+# задержку, так что при поминутном лимите все его повторы тоже получат 429.
+# 429 обрабатывает ask_with_retries — ждёт столько, сколько просит Gemini.
+RETRY_STATUS_CODES = [408, 500, 502, 503, 504]
 
 # Потолок на один прогон. В обычный день кандидатов десятки. Потолок —
 # страховка на случай поломки отбора: если кандидатов вдруг станет 4000,
@@ -201,6 +220,10 @@ class BadAnswer(Exception):
     """Модель ответила, но ответ нельзя записать. Вакансию пропускаем."""
 
 
+class RateLimited(Exception):
+    """429 не прошёл за RATE_LIMIT_ATTEMPTS попыток. Вакансию пропускаем."""
+
+
 def read_api_key() -> str:
     """Достаёт ключ Gemini из окружения; без ключа падаем сразу и внятно."""
     try:
@@ -312,6 +335,43 @@ def ask_gemini(client: genai.Client, title: str, description: str | None) -> dic
     return answer
 
 
+def retry_delay_seconds(error: errors.APIError) -> float:
+    """Достаёт из ошибки 429 рекомендованную задержку в секундах.
+
+    error.details — тело ответа целиком. Нужная часть выглядит так
+    (остальные элементы details опущены):
+        {"error": {"code": 429, "details": [
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo",
+             "retryDelay": "37s"}]}}
+    """
+    for detail in error.details.get("error", {}).get("details", []):
+        if detail.get("@type", "").endswith("RetryInfo"):
+            # "37s" или "37.5s": убираем букву s, остаётся число.
+            return float(detail["retryDelay"].removesuffix("s"))
+    return DEFAULT_RETRY_SECONDS
+
+
+def ask_with_retries(client: genai.Client, title: str, description: str | None) -> dict:
+    """То же, что ask_gemini, но на 429 ждёт рекомендованное время и повторяет."""
+    for attempt in range(1, RATE_LIMIT_ATTEMPTS + 1):
+        try:
+            return ask_gemini(client, title, description)
+        except errors.APIError as error:
+            # Любая другая ошибка API — не про лимит: отдаём её дальше, в enrich.
+            if error.code != 429:
+                raise
+            if attempt == RATE_LIMIT_ATTEMPTS:
+                raise RateLimited(
+                    f"лимит запросов (429), {RATE_LIMIT_ATTEMPTS} попытки не помогли"
+                ) from error
+            delay = retry_delay_seconds(error)
+            print(f"  429, жду {delay:.0f} с (попытка {attempt}/{RATE_LIMIT_ATTEMPTS})", flush=True)
+            time.sleep(delay)
+    # Сюда не дойдём: последняя попытка либо вернула ответ, либо бросила
+    # RateLimited. Строка нужна, чтобы функция явно не возвращала None.
+    raise AssertionError("недостижимо")
+
+
 def to_row(vacancy_key: str, answer: dict) -> dict:
     """Собирает строку для raw.llm_enrichment: ответ модели плюс служебные поля."""
     row = {"vacancy_key": vacancy_key}
@@ -350,27 +410,33 @@ def enrich(limit: int) -> None:
 
     # timeout действует на каждую попытку отдельно, а не на все сразу.
     # Повторы SDK делает сам, с растущей паузой, и только на временных
-    # ошибках: сетевых (истёк таймаут, не удалось соединиться), 429
-    # (превышен лимит) и 5xx (модель перегружена). Неверный ключ или неверный
-    # запрос повторять бессмысленно — они падают сразу. Без retry_options
-    # SDK не повторяет ничего.
+    # ошибках: сетевых (истёк таймаут, не удалось соединиться), 408 и 5xx
+    # (модель перегружена). 429 из его списка убран — см. RETRY_STATUS_CODES.
+    # Неверный ключ или неверный запрос повторять бессмысленно — они падают
+    # сразу. Без retry_options SDK не повторяет ничего.
     client = genai.Client(
         api_key=api_key,
         http_options=types.HttpOptions(
             timeout=REQUEST_TIMEOUT_MS,
-            retry_options=types.HttpRetryOptions(attempts=REQUEST_ATTEMPTS),
+            retry_options=types.HttpRetryOptions(
+                attempts=REQUEST_ATTEMPTS,
+                http_status_codes=RETRY_STATUS_CODES,
+            ),
         ),
     )
+    print(f"модель: {MODEL_NAME}", flush=True)
 
     rows: list[dict] = []     # ответы, ещё не записанные в BigQuery
     enriched = 0              # сколько строк уже записано
     skipped = 0
 
-    # Ошибки трёх сортов, и обращаемся с ними по-разному:
+    # Ошибки четырёх сортов, и обращаемся с ними по-разному:
     #   BadAnswer — модель ответила, но ответ плохой. Это про одну вакансию:
     #     пропускаем её и идём дальше. В таблицу она не попадёт, значит
     #     завтра скрипт попробует снова.
-    #   APIError — сломался сам доступ: ключ, квота, сервис лежит и после
+    #   RateLimited — 429 не отпустил и после повторов. Тоже пропускаем:
+    #     лимит поминутный, следующая вакансия может пройти.
+    #   APIError — сломался сам доступ: ключ, сервис лежит и после
     #     повторов. Дальше идти бессмысленно — падаем с понятным сообщением.
     #   httpx.TransportError — сломалась сеть: соединиться не вышло или ответ
     #     не пришёл за таймаут и после повторов. Следующие вакансии упадут
@@ -383,10 +449,10 @@ def enrich(limit: int) -> None:
             key = vacancy["vacancy_key"]
             progress = f"{number}/{len(candidates)} {key}"
             try:
-                answer = ask_gemini(client, vacancy["title"], vacancy["description"])
-            except BadAnswer as problem:
+                answer = ask_with_retries(client, vacancy["title"], vacancy["description"])
+            except (BadAnswer, RateLimited) as problem:
                 skipped += 1
-                print(f"{progress} ошибка: {problem}", flush=True)
+                print(f"{progress} пропущена: {problem}", flush=True)
             else:
                 # else выполняется, только если в try не было исключения.
                 rows.append(to_row(key, answer))
