@@ -91,6 +91,22 @@ jobs:
       #     GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
       #   run: python -m load.to_bigquery remotive
 
+      # Обогащение языковой моделью: дописывает ответы Gemini в
+      # raw.llm_enrichment, а dbt build ниже подтягивает их в витрины.
+      # Нужны оба доступа: BigQuery — найти вакансии и записать ответы,
+      # Gemini — спросить модель. GEMINI_API_KEY заводится там же, где
+      # ключи Adzuna: Settings → Secrets and variables → Actions.
+      #
+      # Кандидатов скрипт берёт из mart_vacancies_scored, а её dbt пересоберёт
+      # только в следующем шаге. Значит, вакансии, собранные сегодня,
+      # обогатятся при следующем прогоне.
+      - name: Обогатить вакансии через Gemini
+        env:
+          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python -m enrich.with_gemini
+
       # dbt стоит из requirements.txt (dbt-bigquery==1.12.0) — отдельно
       # ставить не нужно, иначе версия окажется прописана в двух местах.
       #

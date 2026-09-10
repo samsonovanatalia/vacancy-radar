@@ -22,3 +22,88 @@ models:
         #   - dbt_utils.accepted_range:
         #       min_value: 1
         #       inclusive: true
+
+  - name: mart_vacancies_scored
+    description: >
+      Все вакансии за последние 14 дней с признаками, причиной исключения
+      и баллом релевантности. Одна строка = одна вакансия. Ничего не
+      выбрасывает: отсеянные строки остаются с заполненным excluded_reason,
+      чтобы решения фильтра можно было сверить с ручной разметкой.
+    columns:
+      - name: vacancy_key
+        description: "Ключ вакансии: source + ':' + source_id. Грейн витрины."
+        tests:
+          # unique здесь сторожит грейн: если в модель когда-нибудь добавят
+          # join, который размножит строки, тест упадёт на сборке.
+          - not_null
+          - unique
+      - name: title
+        tests:
+          - not_null
+      - name: posted_at
+        description: "Дата публикации. Не старше 14 дней на момент сборки."
+        tests:
+          - not_null
+      - name: role_type
+        description: "analytics_engineer / product_analyst / analyst / data_engineer / other — по заголовку."
+      - name: title_core
+        description: >
+          Ядро заголовка для дедупа: без начальной скобки, обрезано до первого
+          разделителя (дефис с пробелом, –, —, |, запятая, «(»), нижний регистр.
+      - name: seniority
+        description: "lead / senior / junior / mid — по заголовку. lead и junior исключаются."
+      - name: is_english
+        description: >
+          false, если английских служебных слов меньше 3 на 100 слов в первых
+          2000 символах описания или в заголовке есть (m/w/d), (m/f/d), (w/m/d).
+      - name: location_fit
+        description: "spain / remote / other — по location и is_remote. Только для балла, не исключает."
+      - name: is_agency
+        description: "Компания похожа на кадровое агентство из списка. На балл не влияет."
+      - name: llm_work_mode
+        description: "Режим работы по ответу модели: onsite / hybrid / remote / unclear. null — не обогащена."
+      - name: llm_location_city
+        description: "Город по ответу модели."
+      - name: llm_residency_requirement
+        description: "Дословное требование жить или иметь право работать в конкретной стране."
+      - name: fits_location
+        description: >
+          Подходит ли локация по фактам от модели: yes / no / unclear.
+          null — обогащения ещё нет, балл считается без этого признака.
+      - name: excluded_reason
+        description: >
+          Первое сработавшее правило: wrong_seniority → not_english →
+          duplicate (компания + title_core) → irrelevant_role.
+          null — вакансия проходит в подборку.
+      - name: relevance_score
+        description: >
+          Эвристика релевантности: за роль +4 analytics_engineer, +3 analyst,
+          +2 product_analyst, +1 data_engineer; +2 spain / +1 remote
+          по location_fit, +3 / −5 за fits_location yes / no, −2 за senior,
+          +1 за указанную зарплату.
+
+  - name: mart_vacancies_for_me
+    description: >
+      Подборка вакансий под мой профиль: то, что бот отправляет в 12:00.
+      Одна строка = одна вакансия. View поверх mart_vacancies_scored:
+      только строки, где excluded_reason is null.
+    columns:
+      - name: vacancy_key
+        description: "Ключ вакансии: source + ':' + source_id. Грейн витрины."
+        tests:
+          # not_null и unique вместе означают «это первичный ключ».
+          # unique здесь не формальность: он ловит поломку дедупликации
+          # в stg_vacancies — если qualify перестанет работать, тест упадёт
+          # тут, а не всплывёт задвоенным сообщением в телеграме.
+          - not_null
+          - unique
+      - name: title
+        description: "Заголовок вакансии как в источнике."
+        tests:
+          - not_null
+      - name: posted_at
+        description: "Дата публикации. Не старше 14 дней на момент сборки."
+        tests:
+          - not_null
+      - name: relevance_score
+        description: "Балл из mart_vacancies_scored. Чем больше, тем выше в подборке."

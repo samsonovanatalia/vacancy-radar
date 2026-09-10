@@ -35,3 +35,18 @@ models:
 
       - name: posted_at
         description: "Когда вакансия опубликована в источнике."
+
+  - name: stg_enrichment
+    description: >
+      Факты о вакансии от языковой модели (Gemini). Одна строка = одна
+      вакансия: из нескольких ответов по одной вакансии берётся самый свежий.
+    columns:
+      - name: vacancy_key
+        description: "Ключ вакансии, тот же, что в stg_vacancies."
+        tests:
+          # unique здесь сторожит не только эту модель: mart_vacancies_scored
+          # делает left join по vacancy_key, и дубль тут размножил бы строки там.
+          - unique
+          - not_null
+      - name: application_deadline
+        description: "Дата из ответа модели; null, если даты нет или она не разобралась."
