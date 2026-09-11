@@ -137,7 +137,10 @@ BATCH_SIZE = 10
 #   v3 — перед описанием блок известных полей (KNOWN_FIELDS). В промпте:
 #        город и страна сначала из известных полей, seniority по словам
 #        в заголовке, пустое поле вместо догадки, summary без рекламы.
-PROMPT_VERSION = "v3"
+#   v4 — description_best вместо description_clean: полный текст со
+#        страницы вакансии, если он скачан (Adzuna), иначе описание из API.
+#        Текст промпта не менялся.
+PROMPT_VERSION = "v4"
 
 PROMPT = """\
 You extract facts from a job posting. You receive a "Known fields" block
@@ -356,8 +359,10 @@ def fetch_candidates(
     # Альтернатива not in (select vacancy_key ...) опасна: если в подзапросе
     # окажется хоть один null, not in не вернёт ничего.
     #
-    # Описание берём уже очищенное — его чистит dbt в stg_vacancies — и
-    # целиком: под размер запроса к модели его обрезает shorten.
+    # Описание берём лучшее из доступных — description_best: полный текст со
+    # страницы вакансии, если он скачан, иначе описание из API. Оба уже
+    # очищены в dbt (stg_vacancy_pages, stg_vacancies). Берём целиком: под
+    # размер запроса к модели текст обрезает shorten.
     #
     # Кроме описания берём поля, которые источник отдал отдельно (KNOWN_FIELDS).
     # У adzuna описание обрезано на 500 символах, и город, компания и
@@ -385,7 +390,7 @@ def fetch_candidates(
             s.salary_min,
             s.salary_max,
             s.salary_text,
-            s.description_clean
+            s.description_best
         from `{project}.{MARTS_DATASET}.mart_vacancies_scored` as s
         where s.excluded_reason is null
           and (@source is null or s.source = @source)
@@ -428,8 +433,9 @@ def build_posting(vacancy: dict) -> str:
 
     # join заранее: в Python 3.11 внутри {} у f-строки нельзя писать \n.
     known_block = "\n".join(known)
-    # or "": description_clean — null, если у вакансии нет описания.
-    description = shorten(vacancy["description_clean"] or "")
+    # or "": description_best — null, если у вакансии нет ни текста со
+    # страницы, ни описания из API.
+    description = shorten(vacancy["description_best"] or "")
     return (
         f"<posting>\n"
         f"Known fields:\n{known_block}\n\n"

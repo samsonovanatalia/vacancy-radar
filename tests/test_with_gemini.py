@@ -123,7 +123,7 @@ def make_vacancy(title: str) -> dict:
     return {
         "vacancy_key": f"test:{title}", "title": title, "company_name": None,
         "location": None, "source": "arbeitnow", "job_types": [], "salary_min": None,
-        "salary_max": None, "salary_text": None, "description_clean": "text",
+        "salary_max": None, "salary_text": None, "description_best": "text",
     }
 
 
