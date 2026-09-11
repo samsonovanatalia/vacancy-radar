@@ -10,7 +10,7 @@
   2. Это не «отдай мне всё», а поиск. У arbeitnow/remoteok/remotive мы
      забирали общий список и фильтровали потом; здесь нужно САМИМ
      сформулировать запросы. Поэтому вверху файла лежит список запросов:
-     четыре фразы × пять городов = 20 обращений к API.
+     четыре фразы × четыре города = 16 обращений к API.
 
   3. У каждой страны свой раздел: .../jobs/es/search/1 — Испания,
      .../jobs/nl/search/1 — Нидерланды. Город задаётся отдельно,
@@ -45,16 +45,20 @@ API_URL = "https://api.adzuna.com/v1/api/jobs/{country}/search/1"
 # добавить профессию — тоже одна, а не четыре новые пары.
 #
 # Сколько городов можно себе позволить: бесплатный ключ Adzuna даёт
-# 1000 вызовов в месяц. Пять городов × четыре фразы = 20 вызовов за прогон,
-# при ежедневном запуске это ~600 в месяц — остаётся запас на ручные
-# перезапуски и отладку. Шестой город (24 вызова, ~730 в месяц) запас уже
-# почти съедает, поэтому дальше расширяемся только вместе с фразами.
+# 1000 вызовов в месяц. Четыре города × четыре фразы = 16 вызовов за прогон,
+# при ежедневном запуске это ~480 в месяц без учёта повторов при сбоях —
+# остаётся запас на ручные перезапуски и отладку. Пятый город (20 вызовов,
+# ~600 в месяц) ещё помещается, шестой (24, ~730) запас почти съедает.
+#
+# Страна города должна быть среди тех, что поддерживает API. Ирландии нет:
+# на .../jobs/ie/... Adzuna отвечает 404 с UNSUPPORTED_COUNTRY и в той же
+# ошибке перечисляет допустимые коды: at, au, be, br, ca, ch, de, es, fr,
+# gb, in, it, mx, nl, nz, pl, sg, us, za (проверено вызовом 2026-09-11).
 LOCATIONS = [
     ("es", "Barcelona"),
     ("es", "Madrid"),
     ("nl", "Amsterdam"),
     ("de", "Berlin"),
-    ("ie", "Dublin"),
 ]
 
 PHRASES = [
@@ -69,9 +73,25 @@ PHRASES = [
 # нас быстро начнут отшивать. Секунда — вежливый минимум.
 PAUSE_SECONDS = 1
 
+# Коды временных сбоев: сервер перегружен (503), споткнулся (500, 502, 504)
+# или просит сбавить темп (429). Через паузу такой запрос обычно проходит.
+# Остальные коды — 400, 401, 403, 404 — постоянные: неверный запрос, ключ
+# или адрес. Повтор их не починит, только потратит месячный лимит ключа.
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+
+# Паузы перед повторами, секунды. Сколько чисел — столько повторов:
+# первая попытка и до трёх повторов, всего до четырёх обращений на запрос.
+# Паузы растут: если Adzuna прилегла на минуту, частые повторы подряд
+# упрутся в тот же сбой.
+RETRY_PAUSES = [5, 15, 45]
+
 # Куда складываем сырой результат. Формат тот же, что у остальных:
 # .jsonl — один JSON-объект в каждой строке файла.
 OUTPUT_PATH = Path(__file__).resolve().parents[1] / "data" / "raw_adzuna.jsonl"
+
+
+class QueryFailed(Exception):
+    """Один запрос к Adzuna не удался: постоянная ошибка или кончились повторы."""
 
 
 def read_credentials() -> tuple[str, str]:
@@ -92,7 +112,11 @@ def read_credentials() -> tuple[str, str]:
 
 def fetch_one(country: str, city: str, phrase: str,
               app_id: str, app_key: str) -> list[dict]:
-    """Делает ОДИН запрос к Adzuna и возвращает список найденных вакансий."""
+    """Делает запрос к Adzuna и возвращает список найденных вакансий.
+
+    При временном сбое (RETRY_STATUS_CODES или таймаут) повторяет с паузами
+    из RETRY_PAUSES. Если запрос так и не удался — бросает QueryFailed.
+    """
     params = {
         "app_id": app_id,
         "app_key": app_key,
@@ -120,23 +144,45 @@ def fetch_one(country: str, city: str, phrase: str,
         "results_per_page": 50,
     }
 
-    response = requests.get(API_URL.format(country=country), params=params, timeout=30)
+    # ВАЖНО: не используем raise_for_status() и не печатаем response.url
+    # или текст сетевой ошибки — в URL лежит app_key целиком, а он не должен
+    # попасть ни в вывод, ни в логи GitHub Actions. Поэтому сообщаем только
+    # код ответа или имя класса ошибки. По той же причине QueryFailed бросаем
+    # с `from None`: иначе Python приклеит к ней исходную ошибку вместе с URL.
+    attempts = len(RETRY_PAUSES) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(API_URL.format(country=country), params=params, timeout=30)
+        except requests.Timeout:
+            # Timeout ловит оба случая: не успели соединиться (ConnectTimeout)
+            # и соединились, но не дождались ответа (ReadTimeout). Запрос
+            # только читает выдачу, повторить его безопасно.
+            problem = "таймаут"
+        except requests.ConnectionError as error:
+            # Соединение оборвалось не по таймауту: DNS, отказ в соединении.
+            # В список временных сбоев это не входит — не повторяем.
+            raise QueryFailed(f"сетевая ошибка {type(error).__name__}") from None
+        else:
+            if response.status_code == 200:
+                # Берём по [], а не .get(): если структура ответа изменится,
+                # пусть скрипт упадёт с понятной ошибкой, а не запишет пустоту.
+                return response.json()["results"]
+            problem = f"код {response.status_code}"
+            if response.status_code not in RETRY_STATUS_CODES:
+                raise QueryFailed(f"{problem}, постоянная ошибка, без повторов")
 
-    # ВАЖНО: не используем raise_for_status() и не печатаем response.url —
-    # в тексте URL лежит app_key целиком, а он не должен попасть ни в вывод,
-    # ни в логи GitHub Actions. Поэтому сообщаем только код ответа.
-    # Ошибку при этом не глотаем: скрипт падает, а не пишет пустоту.
-    if response.status_code != 200:
-        raise SystemExit(
-            f"Adzuna ответила кодом {response.status_code} "
-            f"на запрос «{phrase}» в городе {city}"
-        )
+        if attempt == attempts:
+            raise QueryFailed(f"{problem}, не помогли {attempts} попытки")
+        # attempt начинается с 1, а список пауз — с 0: перед вторым
+        # обращением берём RETRY_PAUSES[0] = 5 секунд.
+        pause = RETRY_PAUSES[attempt - 1]
+        print(f"  {phrase} / {city}: {problem}, попытка {attempt} из {attempts}, "
+              f"повтор через {pause} с")
+        time.sleep(pause)
 
-    payload = response.json()
-
-    # Берём по [], а не .get(): если структура ответа изменится, пусть
-    # скрипт упадёт с понятной ошибкой, а не запишет пустой файл.
-    return payload["results"]
+    # Сюда не дойдём: последняя попытка либо вернула вакансии, либо бросила
+    # QueryFailed. Строка нужна, чтобы функция явно не возвращала None.
+    raise AssertionError("недостижимо")
 
 
 def to_unix(created: str | None) -> int | None:
@@ -220,33 +266,45 @@ def normalize(job: dict, query: str) -> dict:
     }
 
 
-def collect() -> tuple[list[dict], dict[str, int]]:
-    """Обходит все запросы и возвращает вакансии плюс счётчик по запросам."""
+def collect() -> tuple[list[dict], dict[str, int], dict[str, str]]:
+    """Обходит все запросы.
+
+    Возвращает три вещи: вакансии; сколько вакансий пришло по каждому
+    удавшемуся запросу; упавшие запросы с причиной сбоя.
+    """
     app_id, app_key = read_credentials()
 
     result: list[dict] = []
     counts: dict[str, int] = {}
+    failed: dict[str, str] = {}
 
     # Двойной цикл: по каждому городу прогоняем каждую фразу.
-    # 5 городов × 4 фразы = 20 запросов за один прогон.
+    # 4 города × 4 фразы = 16 запросов за один прогон.
     for country, city in LOCATIONS:
         for phrase in PHRASES:
             # Подпись запроса. Кладём её в каждую строку и печатаем в отчёте,
             # так что формат должен быть один и тот же — задаём его здесь.
             query = f"{phrase} / {city}"
 
-            jobs = fetch_one(country, city, phrase, app_id, app_key)
-            counts[query] = len(jobs)
-
-            for job in jobs:
-                result.append(normalize(job, query))
+            # Один упавший запрос не должен стоить всех остальных:
+            # запоминаем сбой и идём дальше. Провал или нет — решаем в конце,
+            # когда видно, удалось ли хоть что-то.
+            try:
+                jobs = fetch_one(country, city, phrase, app_id, app_key)
+            except QueryFailed as problem:
+                failed[query] = str(problem)
+                print(f"  {query}: запрос не удался — {problem}")
+            else:
+                counts[query] = len(jobs)
+                for job in jobs:
+                    result.append(normalize(job, query))
 
             # Пауза после каждого запроса, включая последний: лишняя секунда
             # в конце ничего не стоит, а условие «кроме последнего» — это
             # лишняя ветка в коде ради одной секунды.
             time.sleep(PAUSE_SECONDS)
 
-    return result, counts
+    return result, counts, failed
 
 
 def save(rows: list[dict], path: Path = OUTPUT_PATH) -> None:
@@ -263,15 +321,27 @@ def save(rows: list[dict], path: Path = OUTPUT_PATH) -> None:
     print(f"записано {len(rows)} строк в {path}")
 
 
-def report(counts: dict[str, int]) -> None:
-    """Печатает, сколько вакансий пришло по каждому запросу."""
+def report(counts: dict[str, int], failed: dict[str, str]) -> None:
+    """Печатает, сколько вакансий пришло по каждому запросу, и итог по сбоям."""
     print("сколько пришло по каждому запросу:")
     for query, amount in counts.items():
         print(f"  {query:<40} {amount}")
     print(f"  {'ИТОГО':<40} {sum(counts.values())}")
 
+    total = len(counts) + len(failed)
+    print(f"запросов удалось: {len(counts)} из {total}, упало: {len(failed)}")
+    for query, problem in failed.items():
+        print(f"  сбой: {query:<40} {problem}")
+
 
 if __name__ == "__main__":
-    rows, counts = collect()
-    report(counts)
+    rows, counts, failed = collect()
+    report(counts, failed)
+    # Код возврата решает, пойдёт ли GitHub Actions к следующим шагам.
+    # Частичный успех — не провал: пишем то, что получили, и выходим с 0,
+    # а сбои уже видны в логе через report. Провал — только если не удался
+    # ни один запрос: тогда данных нет совсем, в файл ничего не пишем.
+    # SystemExit со строкой печатает её и завершает скрипт с кодом 1.
+    if not counts:
+        raise SystemExit("Adzuna: не удался ни один запрос, данные не получены.")
     save(rows)
