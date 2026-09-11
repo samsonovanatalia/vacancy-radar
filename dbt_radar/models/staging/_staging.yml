@@ -46,6 +46,43 @@ models:
       - name: posted_at
         description: "Когда вакансия опубликована в источнике."
 
+      - name: description_best
+        description: >
+          Лучший доступный текст вакансии: page_text_clean из stg_vacancy_pages,
+          если полный текст со страницы есть, иначе description_clean.
+
+      - name: description_source
+        description: "Откуда взят description_best: page — со страницы вакансии, api — из API."
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['page', 'api']
+
+  - name: stg_vacancy_pages
+    description: >
+      Страницы вакансий, которые скачивает fetch/adzuna_pages.py. Одна строка =
+      одна вакансия: из нескольких попыток скачать страницу берётся последняя
+      по fetched_at.
+    columns:
+      - name: vacancy_key
+        description: "Ключ вакансии, тот же, что в stg_vacancies."
+        tests:
+          # unique сторожит не только эту модель: stg_vacancies и
+          # mart_vacancies_scored делают left join по vacancy_key, и дубль тут
+          # размножил бы строки там.
+          - unique
+          - not_null
+      - name: http_status
+        description: "Код ответа последней попытки; null — ответа не было (сетевая ошибка, пропуск /land/ad/)."
+      - name: is_dead
+        description: "true, если последняя попытка вернула 404. Нет ответа — false: не проверили, а не сняли."
+      - name: page_text_clean
+        description: >
+          Полный текст со страницы, очищенный макросом clean_html_text — так же,
+          как description_clean. Только у живой страницы (код 200 и разметка
+          JobPosting), иначе null.
+
   - name: stg_enrichment
     description: >
       Факты о вакансии от языковой модели (Gemini). Одна строка = одна

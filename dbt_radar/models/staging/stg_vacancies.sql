@@ -254,15 +254,14 @@ deduplicated as (
 
 ),
 
--- Дальше четыре блока чистят описание. description_clean — это description
+-- Дальше два блока чистят описание. description_clean — это description
 -- без рекламного хвоста arbeitnow, HTML и лишних пробелов. По нему ищутся
 -- навыки (mart_skill_demand), и его получает языковая модель
 -- (enrich/with_gemini.py). Сырой description остаётся рядом без изменений.
 --
--- Шаги разнесены по блокам, чтобы читать их сверху вниз, а не разбирать
--- пять вложенных функций изнутри наружу. select * replace (выражение as
--- колонка) — «все колонки как есть, а эту заменить»: так каждый блок
--- меняет только description_clean. Чистим после deduplicated — меньше строк.
+-- select * replace (выражение as колонка) — «все колонки как есть, а эту
+-- заменить»: так каждый блок меняет только description_clean. Чистим после
+-- deduplicated — меньше строк.
 
 description_without_tail as (
 
@@ -288,87 +287,50 @@ description_without_tail as (
 
 ),
 
-description_unescaped as (
+description_cleaned as (
 
-    -- Шаг 2. HTML-сущности → символы. Готовой функции в BigQuery нет, поэтому
-    -- replace по списку. Список взят из данных: во всех описаниях встречается
-    -- ровно 9 разных сущностей, и все они здесь.
-    --
-    -- Вложенные replace читаются сверху вниз: первой применяется первая пара.
-    -- &amp; раскрываем первым и дважды: часть HTML arbeitnow экранирована
-    -- дважды, и из «&amp;amp;» после первого прохода остаётся «&amp;».
-    -- Раскрываем ДО удаления тегов: экранированный «&lt;p&gt;» станет
-    -- настоящим тегом <p>, и следующий шаг его удалит.
+    -- Шаги 2–4: HTML-сущности, теги, пробелы. Они живут в макросе
+    -- macros/clean_html_text.sql — там же подробные пояснения к каждой
+    -- регулярке. Тем же макросом чистится полный текст со страницы в
+    -- stg_vacancy_pages, так что чистка у двух текстов не разойдётся.
     select * replace (
-        replace(replace(replace(replace(replace(
-        replace(replace(replace(replace(replace(
-            description_clean,
-            '&amp;',   '&'),
-            '&amp;',   '&'),
-            '&#x26;',  '&'),
-            '&lt;',    '<'),
-            '&#x3C;',  '<'),
-            '&gt;',    '>'),
-            '&quot;',  '"'),
-            '&#39;',   "'"),
-            '&nbsp;',  ' '),
-            '&mdash;', '—')                         as description_clean
+        {{ clean_html_text('description_clean') }}  as description_clean
     )
     from description_without_tail
 
 ),
 
-description_without_tags as (
+pages as (
 
-    -- Шаг 3. Теги. Блочные — абзац, перенос, пункт списка, заголовок — меняем
-    -- на перевод строки, чтобы список остался списком. Остальные теги и
-    -- комментарии <!-- --> — на пробел: иначе «<b>SQL</b><b>Python</b>»
-    -- склеилось бы в «SQLPython».
-    -- Тег обязан начинаться с буквы: «<3 years» и «salary < 50k» — это текст.
-    -- (?i) — без учёта регистра; (?s) — точка ловит и перевод строки,
-    -- комментарий бывает многострочным.
-    --
-    -- Внутри тега не бывает «<»: поэтому [^<>]*, а не [^>]*. Это защита от
-    -- оборванных тегов. Arbeitnow заменяет ссылки прочерками и съедает при
-    -- этом «>»: «<a ----- ----- if you need the job advert…</strong>». С [^>]*
-    -- такой «тег» тянулся бы до ближайшей «>» и съедал текст по дороге —
-    -- так пропадали предложения примерно в сотне описаний.
-    -- Сам остаток оборванного тега убирают ещё два варианта в конце списка:
-    --   <[a-zA-Z][^<>\n]*-{5,}  — от «<a» до последних прочерков в строке;
-    --   <[a-zA-Z][^<>]*$        — открытый тег в самом конце текста: так
-    --                             remoteok обрывает картинку, вшитую строкой
-    --                             base64 на 25 тысяч символов.
-    select * replace (
-        regexp_replace(
-            regexp_replace(
-                description_clean,
-                r'(?i)</?(?:p|br|div|li|ul|ol|h[1-6]|tr)\b[^<>]*>', '\n'
-            ),
-            r'(?s)<!--.*?-->|</?[a-zA-Z][^<>]*>|<[a-zA-Z][^<>\n]*-{5,}|<[a-zA-Z][^<>]*$', ' '
-        )                                           as description_clean
-    )
-    from description_unescaped
-
-),
-
-description_collapsed as (
-
-    -- Шаг 4. Пробелы. Сначала любые пробельные символы, кроме перевода
-    -- строки, → один пробел. \s в BigQuery ловит только ASCII-пробелы,
-    -- поэтому добавляем остальные явно: \p{Z} — все разделители Юникода
-    -- (неразрывный пробел, U+2028 «разделитель строк»), \x{85} — «следующая
-    -- строка». Все они в описаниях встречаются.
-    -- Потом перевод строки вместе с пробелами и другими переводами строк
-    -- вокруг → один перевод строки. trim снимает пробелы и переводы строк
-    -- по краям текста.
-    select * replace (
-        trim(regexp_replace(
-            regexp_replace(description_clean, r'[\t\r\f\v\x{85}\p{Z}]+', ' '),
-            r' *\n[ \n]*', '\n'
-        ))                                          as description_clean
-    )
-    from description_without_tags
+    -- Полный текст со страницы вакансии — пока только для Adzuna, где API
+    -- обрезает описание на 500 символах. На вакансию в stg_vacancy_pages не
+    -- больше одной строки (тест unique), так что left join строк не размножит.
+    select
+        vacancy_key,
+        page_text_clean
+    from {{ ref('stg_vacancy_pages') }}
 
 )
 
-select * from description_collapsed
+select
+    vacancies.*,
+
+    -- Лучший доступный текст вакансии: полный со страницы, если он есть,
+    -- иначе описание из API. На странице Adzuna текст в 10–17 раз длиннее,
+    -- и в нём бывают зарплата, стек и требование к резидентству.
+    coalesce(pages.page_text_clean, vacancies.description_clean)
+                                                    as description_best,
+
+    -- Откуда взялся description_best: 'page' — со страницы, 'api' — из API.
+    -- Нужен, чтобы при разборе было видно, полный это текст или обрывок.
+    case
+        when pages.page_text_clean is not null then 'page'
+        else 'api'
+    end                                             as description_source
+
+from description_cleaned as vacancies
+
+-- left join, а не join: страницы скачаны у малой части вакансий, и обычный
+-- join выбросил бы все остальные.
+left join pages
+    on pages.vacancy_key = vacancies.vacancy_key
