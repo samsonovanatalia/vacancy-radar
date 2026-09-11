@@ -72,12 +72,12 @@ TAIL_CHARS = 8_000
 # попадёт в ту же минуту.
 PAUSE_SECONDS = 5
 
-# Сколько раз пробуем одну вакансию, упираясь в 429, считая первую попытку.
-RATE_LIMIT_ATTEMPTS = 3
+# Сколько раз пробуем одну вакансию при временном сбое, считая первую попытку.
+RETRY_ATTEMPTS = 3
 
-# Собственная пауза перед первым повтором на 429. С каждой следующей
-# попыткой удваивается: 20, 40, 80 секунд. Ждём дольше из двух чисел —
-# этой паузы или рекомендованной задержки из ответа Gemini.
+# Собственная пауза перед первым повтором. С каждой следующей попыткой
+# удваивается: при трёх попытках это 20 и 40 секунд. На 429 ждём дольше
+# из двух чисел — этой паузы или рекомендованной задержки из ответа Gemini.
 RETRY_BASE_SECONDS = 20
 
 # Таймаут на одну попытку запроса к модели. HttpOptions принимает его
@@ -86,14 +86,14 @@ RETRY_BASE_SECONDS = 20
 # весь прогон.
 REQUEST_TIMEOUT_MS = 60_000
 
-# Попыток всего, считая первую: один запрос и не больше двух повторов.
-REQUEST_ATTEMPTS = 3
-
-# На каких кодах повторяет сам SDK. Это его список по умолчанию, но без 429:
-# SDK повторяет через 1, 2, 4 секунды и не смотрит на рекомендованную
-# задержку, так что при поминутном лимите все его повторы тоже получат 429.
-# 429 обрабатывает ask_with_retries — ждёт столько, сколько просит Gemini.
-RETRY_STATUS_CODES = [408, 500, 502, 503, 504]
+# Коды временных сбоев — через паузу такой запрос обычно проходит:
+#   429 — упёрлись в поминутный лимит (суточный — см. daily_quota_violation);
+#   500, 502, 503 — у Gemini что-то сломалось или модель перегружена;
+#   504 — модель не успела ответить (DEADLINE_EXCEEDED);
+#   408 — сервер не дождался нашего запроса.
+# Остальные коды — 400 неверный запрос, 403 ключ, 404 модель — от повтора
+# не починятся: такую вакансию пропускаем сразу.
+TEMPORARY_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 # Потолок на один прогон. В обычный день кандидатов десятки. Потолок —
 # страховка на случай поломки отбора: если кандидатов вдруг станет 4000,
@@ -101,6 +101,14 @@ RETRY_STATUS_CODES = [408, 500, 502, 503, 504]
 # Не влезшие вакансии обогатятся в следующие дни, самые релевантные — первыми.
 # Аргументом командной строки потолок можно опустить, но не поднять.
 MAX_PER_RUN = 100
+
+# Предохранитель: столько вакансий подряд со сбоем — и прогон останавливается.
+# Один-два сбоя — беда отдельной вакансии; пять подряд — почти наверняка
+# общая поломка: Gemini лежит, ключ отозван, пропала сеть. Без предохранителя
+# скрипт честно прошёл бы всех кандидатов с повторами — около 2,5 минуты на
+# каждого, при потолке 100 это больше четырёх часов. Разрозненные сбои не
+# копятся: любой успех обнуляет счёт.
+MAX_CONSECUTIVE_FAILURES = 5
 
 # Допустимые значения --source. Тот же список, что в accepted_values колонки
 # source в dbt_radar/models/staging/_staging.yml: появится источник — дописать
@@ -271,8 +279,8 @@ class BadAnswer(Exception):
     """Модель ответила, но ответ нельзя записать. Вакансию пропускаем."""
 
 
-class RateLimited(Exception):
-    """429 не прошёл за RATE_LIMIT_ATTEMPTS попыток. Вакансию пропускаем."""
+class RetriesExhausted(Exception):
+    """Временный сбой не прошёл за RETRY_ATTEMPTS попыток. Вакансию пропускаем."""
 
 
 class DailyQuotaExhausted(Exception):
@@ -510,38 +518,50 @@ def daily_quota_violation(error: errors.APIError) -> dict | None:
 
 
 def ask_with_retries(client: genai.Client, posting: str) -> dict:
-    """То же, что ask_gemini, но на 429 ждёт рекомендованное время и повторяет."""
-    for attempt in range(1, RATE_LIMIT_ATTEMPTS + 1):
+    """То же, что ask_gemini, но при временном сбое ждёт и повторяет.
+
+    Временный сбой — код из TEMPORARY_STATUS_CODES, таймаут или не удалось
+    соединиться. Постоянные ошибки API отдаёт дальше сразу, без повторов.
+    """
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        # Своя пауза удваивается с каждой попыткой: 20 * 2**0 = 20, 20 * 2**1 = 40.
+        backoff = RETRY_BASE_SECONDS * 2 ** (attempt - 1)
         try:
             return ask_gemini(client, posting)
+        except (httpx.TimeoutException, httpx.ConnectError) as error:
+            # Сеть: ответ не пришёл за REQUEST_TIMEOUT_MS или не удалось
+            # соединиться. Ключ уходит в заголовке, а не в адресе, так что
+            # текст ошибки печатать безопасно.
+            problem = f"сетевая ошибка {type(error).__name__}: {error}"
+            delay = backoff
         except errors.APIError as error:
-            # Любая другая ошибка API — не про лимит: отдаём её дальше, в enrich.
-            if error.code != 429:
+            if error.code not in TEMPORARY_STATUS_CODES:
                 raise
-            # Тело ответа целиком: по одному коду 429 не понять, какой лимит
-            # превышен — в минуту, в день или на токены. Это написано в теле.
-            body = json.dumps(error.details, ensure_ascii=False, indent=2)
-            print(f"  429, ответ Gemini:\n{body}", flush=True)
-            # Суточную квоту повторять бессмысленно: она обнулится только
-            # завтра, и каждая следующая вакансия получит тот же 429.
-            daily = daily_quota_violation(error)
-            if daily is not None:
-                raise DailyQuotaExhausted(
-                    f"{daily.get('quotaValue', 'не указан в ответе')} "
-                    f"({daily['quotaId']})"
-                ) from error
-            if attempt == RATE_LIMIT_ATTEMPTS:
-                raise RateLimited(
-                    f"лимит запросов (429), {RATE_LIMIT_ATTEMPTS} попытки не помогли"
-                ) from error
-            # Своя пауза удваивается с каждой попыткой: 20 * 2**0 = 20,
-            # 20 * 2**1 = 40, 20 * 2**2 = 80. Ждём большее из двух чисел.
-            backoff = RETRY_BASE_SECONDS * 2 ** (attempt - 1)
-            delay = max(retry_delay_seconds(error), backoff)
-            print(f"  429, жду {delay:.0f} с (попытка {attempt}/{RATE_LIMIT_ATTEMPTS})", flush=True)
-            time.sleep(delay)
+            # str(error) тянет за собой всё тело ответа — берём три поля.
+            problem = f"{error.code} {error.status} {error.message}"
+            delay = backoff
+            if error.code == 429:
+                # Тело ответа целиком: по одному коду 429 не понять, какой лимит
+                # превышен — в минуту, в день или на токены. Это написано в теле.
+                body = json.dumps(error.details, ensure_ascii=False, indent=2)
+                print(f"  429, ответ Gemini:\n{body}", flush=True)
+                # Суточную квоту повторять бессмысленно: она обнулится только
+                # завтра, и каждая следующая вакансия получит тот же 429.
+                daily = daily_quota_violation(error)
+                if daily is not None:
+                    raise DailyQuotaExhausted(
+                        f"{daily.get('quotaValue', 'не указан в ответе')} "
+                        f"({daily['quotaId']})"
+                    ) from error
+                # Рекомендованная задержка бывает только у 429.
+                delay = max(retry_delay_seconds(error), backoff)
+
+        if attempt == RETRY_ATTEMPTS:
+            raise RetriesExhausted(f"{problem}; не помогли {RETRY_ATTEMPTS} попытки")
+        print(f"  {problem}, жду {delay:.0f} с (попытка {attempt}/{RETRY_ATTEMPTS})", flush=True)
+        time.sleep(delay)
     # Сюда не дойдём: последняя попытка либо вернула ответ, либо бросила
-    # RateLimited. Строка нужна, чтобы функция явно не возвращала None.
+    # исключение. Строка нужна, чтобы функция явно не возвращала None.
     raise AssertionError("недостижимо")
 
 
@@ -583,17 +603,16 @@ def enrich(limit: int, source: str | None) -> None:
     print(f"кандидатов на обогащение: {len(candidates)}", flush=True)
 
     # timeout действует на каждую попытку отдельно, а не на все сразу.
-    # Повторы SDK делает сам, с растущей паузой, и только на временных
-    # ошибках: сетевых (истёк таймаут, не удалось соединиться), 408 и 5xx
-    # (модель перегружена). 429 из его списка убран — см. RETRY_STATUS_CODES.
-    # Неверный ключ или неверный запрос повторять бессмысленно — они падают
-    # сразу. Без retry_options SDK не повторяет ничего.
+    # retry_options не задаём, и SDK сам ничего не повторяет: все повторы —
+    # в ask_with_retries. Если повторять и в SDK, и в нашем коде, на 5xx слои
+    # перемножатся: 3 попытки SDK × 3 наших = до девяти запросов на вакансию,
+    # а в логе видно только три. В одном месте видно всё: попытки, паузы, лог.
     #
     # Счётчик запросов к модели, включая неудачные (429, 5xx, таймауты):
     # неудачный запрос тоже списывается с квоты, а нам нужен реальный расход.
-    # Считаем не в ask_gemini, а хуком httpx — функцией, которую HTTP-клиент
-    # вызывает перед отправкой каждого запроса. Так в счёт попадают и повторы,
-    # которые SDK делает сам на 408 и 5xx: из нашего кода их не видно.
+    # Считаем хуком httpx — функцией, которую HTTP-клиент вызывает перед
+    # отправкой каждого запроса. Хук считает то, что реально ушло в сеть,
+    # кто бы и сколько раз ни вызвал отправку.
     requests_sent = 0
 
     def count_request(request: httpx.Request) -> None:
@@ -607,31 +626,31 @@ def enrich(limit: int, source: str | None) -> None:
             # client_args SDK передаёт в httpx.Client, в котором и живут хуки.
             client_args={"event_hooks": {"request": [count_request]}},
             timeout=REQUEST_TIMEOUT_MS,
-            retry_options=types.HttpRetryOptions(
-                attempts=REQUEST_ATTEMPTS,
-                http_status_codes=RETRY_STATUS_CODES,
-            ),
         ),
     )
     print(f"модель: {MODEL_NAME}", flush=True)
 
-    rows: list[dict] = []     # ответы, ещё не записанные в BigQuery
-    enriched = 0              # сколько строк уже записано
-    skipped = 0
+    rows: list[dict] = []           # ответы, ещё не записанные в BigQuery
+    enriched = 0                    # сколько строк уже записано
+    failed: dict[str, str] = {}     # vacancy_key → причина сбоя
+    failures_in_a_row = 0           # сбоев подряд; любой успех обнуляет
 
-    # Ошибки пяти сортов, и обращаемся с ними по-разному:
-    #   BadAnswer — модель ответила, но ответ плохой. Это про одну вакансию:
-    #     пропускаем её и идём дальше. В таблицу она не попадёт, значит
-    #     завтра скрипт попробует снова.
-    #   RateLimited — 429 не отпустил и после повторов. Тоже пропускаем:
-    #     лимит поминутный, следующая вакансия может пройти.
-    #   DailyQuotaExhausted — 429 из-за суточной квоты. Следующие вакансии
-    #     упрутся в неё же до завтра, поэтому останавливаем прогон.
-    #   APIError — сломался сам доступ: ключ, сервис лежит и после
-    #     повторов. Дальше идти бессмысленно — падаем с понятным сообщением.
-    #   httpx.TransportError — сломалась сеть: соединиться не вышло или ответ
-    #     не пришёл за таймаут и после повторов. Следующие вакансии упадут
-    #     так же, поэтому тоже падаем.
+    # Сбой на одной вакансии не прерывает прогон: пишем его в лог и в failed
+    # и идём к следующей. Сбоем вакансии считаем:
+    #   BadAnswer — модель ответила, но ответ нельзя записать;
+    #   RetriesExhausted — временный сбой (429, 5xx, таймаут) не прошёл
+    #     и после повторов;
+    #   APIError — постоянная ошибка API (400, 403, 404), её не повторяли;
+    #   httpx.TransportError — прочие сетевые ошибки, их тоже не повторяли.
+    # Незаписанная вакансия остаётся кандидатом: следующий прогон попробует снова.
+    #
+    # Весь прогон останавливают две вещи:
+    #   DailyQuotaExhausted — суточная квота общая, и каждая следующая
+    #     вакансия упрётся в неё же до завтра;
+    #   предохранитель — MAX_CONSECUTIVE_FAILURES сбоев подряд: сломано
+    #     что-то общее, и оставшиеся вакансии упадут так же.
+    # Ошибки в нашем коде (KeyError, TypeError) сбоем вакансии не считаются
+    # и роняют прогон: это баг, и его надо увидеть сразу.
     #
     # finally дописывает неполную последнюю порцию даже при падении: иначе
     # ошибка на 49-й вакансии выбросила бы 9 готовых ответов и потраченную квоту.
@@ -639,19 +658,43 @@ def enrich(limit: int, source: str | None) -> None:
         for number, vacancy in enumerate(candidates, start=1):
             key = vacancy["vacancy_key"]
             progress = f"{number}/{len(candidates)} {key}"
+            # Причина сбоя. Каждая ветка except только описывает сбой, а
+            # считаем и печатаем его ниже в одном месте — иначе счётчик
+            # пришлось бы увеличивать в трёх ветках и легко забыть одну.
+            reason = None
             try:
                 answer = ask_with_retries(client, build_posting(vacancy))
-            except (BadAnswer, RateLimited) as problem:
-                skipped += 1
-                print(f"{progress} пропущена: {problem}", flush=True)
+            except (BadAnswer, RetriesExhausted) as problem:
+                reason = str(problem)
+            except errors.APIError as error:
+                # str(error) тянет за собой всё тело ответа — берём три поля.
+                reason = f"{error.code} {error.status} {error.message}"
+            except httpx.TransportError as error:
+                reason = f"сетевая ошибка {type(error).__name__}: {error}"
             else:
                 # else выполняется, только если в try не было исключения.
+                failures_in_a_row = 0
                 rows.append(to_row(key, answer))
                 print(f"{progress} ok", flush=True)
                 if len(rows) == BATCH_SIZE:
                     save(bq, table_id, rows)
                     enriched += len(rows)
                     rows = []
+
+            if reason is not None:
+                failed[key] = reason
+                failures_in_a_row += 1
+                print(f"{progress} пропущена: {reason}", flush=True)
+                if failures_in_a_row == MAX_CONSECUTIVE_FAILURES:
+                    print(
+                        f"прогон остановлен досрочно: {MAX_CONSECUTIVE_FAILURES} вакансий "
+                        f"подряд завершились сбоем, последний — {reason}. Похоже, сломано "
+                        f"что-то общее; не обработано вакансий: {len(candidates) - number}.",
+                        flush=True,
+                    )
+                    # break выходит из цикла; finally ниже всё равно сохранит
+                    # готовые ответы и напечатает итог.
+                    break
 
             time.sleep(PAUSE_SECONDS)
     except DailyQuotaExhausted as quota:
@@ -660,34 +703,28 @@ def enrich(limit: int, source: str | None) -> None:
             f"Суточная квота модели {MODEL_NAME} исчерпана, лимит: {quota}. "
             f"Продолжить можно завтра."
         ) from quota
-    except errors.APIError as error:
-        print(f"{progress} ошибка: {error.code} {error.status} {error.message}", flush=True)
-        raise SystemExit(
-            f"Gemini ответила ошибкой {error.code} {error.status} "
-            f"на вакансии {key}: {error.message}"
-        ) from error
-    except httpx.TransportError as error:
-        print(f"{progress} ошибка: {type(error).__name__}: {error}", flush=True)
-        raise SystemExit(
-            f"Сетевая ошибка на вакансии {key}, прогон остановлен: "
-            f"{type(error).__name__}: {error}"
-        ) from error
     finally:
-        # Печатаем в finally, и первым делом: расход квоты должен быть виден
-        # и при остановке на суточной квоте или ошибке, когда до итога ниже
-        # дело не дойдёт.
-        print(f"запросов к модели: {requests_sent}", flush=True)
         if rows:
             save(bq, table_id, rows)
             enriched += len(rows)
+        # Итог — в finally: он нужен и когда прогон остановила суточная квота.
+        print(
+            f"итог: обогащено {enriched}, пропущено {len(failed)}, "
+            f"запросов к модели {requests_sent}",
+            flush=True,
+        )
+        for failed_key, failed_reason in failed.items():
+            print(f"  сбой: {failed_key} — {failed_reason}", flush=True)
 
-    print(f"обогатил: {enriched}, пропустил: {skipped}", flush=True)
-
-    # Если кандидаты были, а не обогатилась ни одна — это уже не «плохой
-    # ответ по одной вакансии», а поломка промпта или схемы. Молча
-    # завершиться с кодом 0 нельзя: в GitHub Actions шаг выглядел бы зелёным.
+    # Код 1 — только если кандидаты были, а не обогатилась ни одна: тогда
+    # сломано что-то общее (ключ, модель, промпт), а не отдельная вакансия.
+    # Частичный успех — код 0: шаг зелёный, а сбои видны в итоге выше.
+    # После досрочной остановки правило то же: обогатили хоть одну — код 0.
     if candidates and not enriched:
-        raise SystemExit("Не обогатилась ни одна вакансия: проверьте промпт и схему ответа.")
+        raise SystemExit(
+            f"Не обогатилась ни одна вакансия из {len(candidates)}: "
+            f"причины — в списке сбоев выше."
+        )
 
 
 if __name__ == "__main__":
