@@ -8,9 +8,9 @@
 -- таблице видно, КАКОЕ правило её отсеяло, и это можно сверить с ручной
 -- разметкой. Фильтр в where не оставил бы следа — отлаживать вслепую.
 --
--- ГРЕЙН: одна вакансия (vacancy_key), как в stg_vacancies. Join один —
--- left join к stg_enrichment, где на вакансию не больше одной строки,
--- поэтому строк не становится больше. group by нет; оконная функция
+-- ГРЕЙН: одна вакансия (vacancy_key), как в stg_vacancies. Join два —
+-- left join к stg_enrichment и к stg_vacancy_pages, в обеих на вакансию
+-- не больше одной строки, поэтому строк не становится больше. group by нет; оконная функция
 -- в блоке ranked только нумерует строки, но не схлопывает их.
 --
 -- select * ниже встречается только в промежуточных блоках, где он просто
@@ -32,6 +32,18 @@ with enrichment as (
         residency_requirement                       as llm_residency_requirement,
         enriched_at                                 as llm_enriched_at
     from {{ ref('stg_enrichment') }}
+
+),
+
+pages as (
+
+    -- Признак снятой вакансии со страницы. Страницы скачиваются пока только
+    -- для Adzuna: у вакансий других источников строки здесь нет, и после
+    -- left join is_dead у них null — правило dead их не трогает.
+    select
+        vacancy_key,
+        is_dead
+    from {{ ref('stg_vacancy_pages') }}
 
 ),
 
@@ -97,6 +109,9 @@ vacancies as (
     -- не выбрасывает ничего. using (vacancy_key) — то же, что
     -- on a.vacancy_key = b.vacancy_key, но колонка в результате одна.
     left join enrichment using (vacancy_key)
+
+    -- То же для страниц: страницы нет — вакансия остаётся, is_dead null.
+    left join pages using (vacancy_key)
 
     -- Окно в две недели. Строки без posted_at сравнение отсекает (null >= x
     -- даёт null, а не true) — вакансию без даты считать свежей нельзя.
@@ -247,16 +262,26 @@ ranked as (
         -- row_number нумерует строки внутри группы в порядке order by;
         -- номер 1 остаётся, остальные станут duplicate.
         --
-        -- Первым ключом сортировки стоит «уже исключена предыдущим правилом».
+        -- Первые ключи сортировки — «вакансию всё равно исключит другое
+        -- правило»: сначала мёртвая ли она, потом исключённые грейд и язык.
         -- false сортируется раньше true, поэтому живые кандидаты идут первыми.
         -- Без этого свежая «Data Engineer (m/w/d)» получила бы номер 1 (и ушла
         -- как not_english), а более старая английская «Data Engineer» —
         -- номер 2 (и ушла как duplicate). Потеряли бы обе.
+        -- С мёртвыми то же самое: снятая «Senior Analytics Engineer» Zynga
+        -- выигрывала дедуп, её копии уходили как duplicate, а она сама —
+        -- как dead, и из подборки пропадала вся группа.
+        --
+        -- coalesce обязателен: у вакансий без скачанной страницы is_dead null,
+        -- а null при сортировке по возрастанию идёт ПЕРВЫМ, раньше false.
+        -- Без coalesce непроверенная вакансия обходила бы проверенную живую.
+        --
         -- vacancy_key в конце — чтобы при одинаковом posted_at результат
         -- не менялся от прогона к прогону.
         row_number() over (
             partition by lower(company_name), title_core
             order by
+                coalesce(is_dead, false),
                 (seniority in ('lead', 'junior') or not is_english),
                 posted_at desc,
                 vacancy_key
@@ -285,8 +310,13 @@ select
     tags,
     job_types,
     description,
-    -- Чистое описание из staging. Его читает скрипт обогащения.
+    -- Чистое описание из API. По нему считается is_english.
     description_clean,
+    -- Лучший доступный текст: полный со страницы, если он есть, иначе
+    -- description_clean. Его читает скрипт обогащения (enrich/with_gemini.py).
+    description_best,
+    -- Откуда взят description_best: 'page' или 'api'.
+    description_source,
 
     role_type,
     seniority,
@@ -301,11 +331,15 @@ select
 
     -- Первое сработавшее правило. Если не сработало ни одно, case без else
     -- вернёт null — это и значит «вакансия проходит в подборку».
+    --
+    -- dead — страница вакансии отдала 404 (stg_vacancy_pages). У вакансий без
+    -- скачанной страницы is_dead null: when null не срабатывает, как false.
     case
         when seniority in ('lead', 'junior')    then 'wrong_seniority'
         when not is_english                     then 'not_english'
         when dedup_rank > 1                     then 'duplicate'
         when role_type = 'other'                then 'irrelevant_role'
+        when is_dead                            then 'dead'
     end                                                 as excluded_reason,
 
     -- Балл считаем для всех строк, в том числе исключённых: так при сверке

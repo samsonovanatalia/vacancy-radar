@@ -51,7 +51,14 @@ models:
           Ядро заголовка для дедупа: без начальной скобки, обрезано до первого
           разделителя (дефис с пробелом, –, —, |, запятая, «(»), нижний регистр.
       - name: description_clean
-        description: "Описание без HTML из stg_vacancies. Его отправляет в модель enrich/with_gemini.py."
+        description: "Описание из API без HTML, из stg_vacancies. По нему считается is_english."
+      - name: description_best
+        description: >
+          Лучший доступный текст из stg_vacancies: полный со страницы вакансии,
+          если он есть, иначе description_clean. Его отправляет в модель
+          enrich/with_gemini.py.
+      - name: description_source
+        description: "Откуда взят description_best: page — со страницы вакансии, api — из API."
       - name: seniority
         description: "lead / senior / junior / mid — по заголовку. lead и junior исключаются."
       - name: is_english
@@ -76,7 +83,8 @@ models:
       - name: excluded_reason
         description: >
           Первое сработавшее правило: wrong_seniority → not_english →
-          duplicate (компания + title_core) → irrelevant_role.
+          duplicate (компания + title_core) → irrelevant_role →
+          dead (страница вакансии отдала 404, см. stg_vacancy_pages).
           null — вакансия проходит в подборку.
       - name: relevance_score
         description: >
@@ -84,6 +92,55 @@ models:
           +2 product_analyst, +1 data_engineer; +2 spain / +1 remote
           по location_fit, +3 / −5 за fits_location yes / no, −2 за senior,
           +1 за указанную зарплату.
+
+  - name: mart_digest_daily
+    description: >
+      Ежедневный дайджест: до 10 лучших вакансий с фактами от языковой модели.
+      Одна строка = одна вакансия, отобранная в дайджест. Отбор: excluded_reason
+      is null, вакансия не помечена мёртвой (stg_vacancy_pages.is_dead),
+      опубликована не раньше 7 дней назад. Порядок: relevance_score по
+      убыванию, при равном балле обогащённые выше, потом posted_at по убыванию.
+      Необогащённая вакансия остаётся, поля модели у неё пустые.
+    columns:
+      - name: vacancy_key
+        description: "Ключ вакансии: source + ':' + source_id. Грейн витрины."
+        tests:
+          - not_null
+          - unique
+      - name: posted_at
+        description: "Дата публикации. Не старше 7 дней на момент сборки."
+      - name: title
+        tests:
+          - not_null
+      - name: company_name
+        tests:
+          - not_null
+      - name: location_city
+        description: "Город по ответу модели. null — не обогащена или город не указан."
+      - name: location_country
+        description: "Страна по ответу модели, ISO 3166-1 alpha-2."
+      - name: work_mode
+        description: "Режим работы по ответу модели: onsite / hybrid / remote / unclear."
+      - name: seniority
+        description: "Уровень по ответу модели: по заголовку и требуемому опыту. Не путать с seniority по заголовку в mart_vacancies_scored."
+      - name: stack
+        description: "Технологии и инструменты, названные в тексте, по ответу модели."
+      - name: salary_min
+        description: "Зарплата, найденная моделью в тексте. Прогноз Adzuna сюда не попадает."
+      - name: residency_requirement
+        description: "Дословное требование жить или иметь право работать в конкретной стране."
+      - name: summary
+        description: "Суть вакансии в 2–3 предложениях от модели."
+      - name: url
+        description: "Ссылка на вакансию в источнике."
+        tests:
+          - not_null
+      - name: relevance_score
+        description: "Балл из mart_vacancies_scored."
+      - name: description_source
+        description: "По какому тексту судим о вакансии: page — полный со страницы, api — из API."
+      - name: prompt_version
+        description: "Версия промпта ответа модели. null — вакансия не обогащена."
 
   - name: mart_vacancies_for_me
     description: >
