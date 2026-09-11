@@ -200,7 +200,18 @@ features as (
         coalesce(regexp_contains(
             lower(company_name),
             r'\b(randstad|careerwise|hays|michael page|adecco|manpower|k-lagan|experis|page personnel)'
-        ), false)                                       as is_agency
+        ), false)                                       as is_agency,
+
+        -- Заголовок продаж, работы с клиентами или найма — не роль про данные,
+        -- даже если в заголовке есть слова про данные. «Account Executive,
+        -- Business Intelligence» ветка analytics_engineer в role_type забирает
+        -- по словам business intelligence, хотя это продажи.
+        -- \b с обеих сторон — слова целиком: «Salesforce» и «presales» не ловятся.
+        -- Цена: «Sales Data Analyst» тоже отсеется. На 11.09.2026 таких заголовков
+        -- в подборке нет — «Sales Analyst» и похожие уже исключает irrelevant_role.
+        regexp_contains(title_normalized,
+            r'\b(account executive|sales|business development|account manager|customer success|recruiter)\b')
+                                                        as is_non_data_title
 
     from vacancies
 
@@ -263,7 +274,8 @@ ranked as (
         -- номер 1 остаётся, остальные станут duplicate.
         --
         -- Первые ключи сортировки — «вакансию всё равно исключит другое
-        -- правило»: сначала мёртвая ли она, потом исключённые грейд и язык.
+        -- правило»: сначала мёртвая ли она, потом исключённые грейд, язык и
+        -- заголовок не про данные.
         -- false сортируется раньше true, поэтому живые кандидаты идут первыми.
         -- Без этого свежая «Data Engineer (m/w/d)» получила бы номер 1 (и ушла
         -- как not_english), а более старая английская «Data Engineer» —
@@ -282,7 +294,7 @@ ranked as (
             partition by lower(company_name), title_core
             order by
                 coalesce(is_dead, false),
-                (seniority in ('lead', 'junior') or not is_english),
+                (seniority in ('lead', 'junior') or not is_english or is_non_data_title),
                 posted_at desc,
                 vacancy_key
         )                                               as dedup_rank
@@ -323,6 +335,7 @@ select
     is_english,
     location_fit,
     is_agency,
+    is_non_data_title,
 
     llm_work_mode,
     llm_location_city,
@@ -334,12 +347,17 @@ select
     --
     -- dead — страница вакансии отдала 404 (stg_vacancy_pages). У вакансий без
     -- скачанной страницы is_dead null: when null не срабатывает, как false.
+    --
+    -- non_data_role — заголовок продаж, работы с клиентами или найма
+    -- (is_non_data_title). Последним, чтобы у остальных вакансий причина
+    -- исключения не поменялась.
     case
         when seniority in ('lead', 'junior')    then 'wrong_seniority'
         when not is_english                     then 'not_english'
         when dedup_rank > 1                     then 'duplicate'
         when role_type = 'other'                then 'irrelevant_role'
         when is_dead                            then 'dead'
+        when is_non_data_title                  then 'non_data_role'
     end                                                 as excluded_reason,
 
     -- Балл считаем для всех строк, в том числе исключённых: так при сверке

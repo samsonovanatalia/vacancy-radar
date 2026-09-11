@@ -70,6 +70,11 @@ models:
         description: "spain / remote / other — по location и is_remote. Только для балла, не исключает."
       - name: is_agency
         description: "Компания похожа на кадровое агентство из списка. На балл не влияет."
+      - name: is_non_data_title
+        description: >
+          В заголовке слова продаж, работы с клиентами или найма: account executive,
+          sales, business development, account manager, customer success, recruiter.
+          Такая вакансия исключается как non_data_role.
       - name: llm_work_mode
         description: "Режим работы по ответу модели: onsite / hybrid / remote / unclear. null — не обогащена."
       - name: llm_location_city
@@ -84,7 +89,8 @@ models:
         description: >
           Первое сработавшее правило: wrong_seniority → not_english →
           duplicate (компания + title_core) → irrelevant_role →
-          dead (страница вакансии отдала 404, см. stg_vacancy_pages).
+          dead (страница вакансии отдала 404, см. stg_vacancy_pages) →
+          non_data_role (заголовок продаж, работы с клиентами или найма).
           null — вакансия проходит в подборку.
       - name: relevance_score
         description: >
