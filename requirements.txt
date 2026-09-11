@@ -7,5 +7,6 @@ google-cloud-bigquery==3.27.0      # загрузка данных в BigQuery
 dbt-bigquery==1.12.0                # dbt для BigQuery
 # dlt[bigquery]==1.5.0               # библиотека загрузки для остальных источников
 google-genai==2.22.0               # обращение к модели Gemini
-httpx==0.28.1                      # приходит с google-genai; импортируем ради сетевых ошибок
+httpx==0.28.1                      # приходит с google-genai; enrich — сетевые ошибки, fetch — загрузка страниц
+beautifulsoup4==4.15.0             # разбор HTML страниц вакансий: fetch/adzuna_pages.py
 # python-dotenv==1.0.1               # чтение ключей из файла .env
