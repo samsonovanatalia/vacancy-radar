@@ -91,15 +91,77 @@ jobs:
       #     GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
       #   run: python -m load.to_bigquery remotive
 
+      # Дальше витрины пересчитываются трижды. Скачивание страниц и обогащение
+      # берут кандидатов из витрин, и каждому шагу нужны свежие данные
+      # предыдущего:
+      #   1. dbt build — сегодняшние вакансии попадают в подборку;
+      #   2. скачать страницы Adzuna — полный текст для вакансий подборки;
+      #   3. dbt build — текст страниц попадает в description_best, снятые
+      #      вакансии (код 404) выпадают из подборки;
+      #   4. обогатить через Gemini — уже по полному тексту;
+      #   5. dbt build — ответы модели попадают в баллы, подборку и дайджест.
+      # Без пересборки между 2 и 4 вакансия обогатилась бы по описанию из API,
+      # обрезанному на 500 символах, а второй раз обогащение её не взяло бы:
+      # ответ этой версии промпта у неё уже есть.
+      #
+      # dbt стоит из requirements.txt (dbt-bigquery==1.12.0) — отдельно
+      # ставить не нужно, иначе версия окажется прописана в двух местах.
+      #
+      # --project-dir  — где лежит dbt_project.yml и папка models
+      # --profiles-dir — где лежит profiles.yml с подключением к BigQuery
+      # По умолчанию dbt ищет профиль в ~/.dbt/ — на раннере такой папки нет,
+      # поэтому показываем ему нашу.
+      #
+      # build = run + test: сначала пересобирает модель, сразу проверяет её
+      # тестами и только потом идёт к следующей. Если тест упал — дальше
+      # по цепочке не пойдёт, и битые данные не доедут до marts.
+      - name: Пересчитать модели dbt — сегодняшние вакансии
+        env:
+          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+        run: |
+          dbt build \
+            --project-dir dbt_radar \
+            --profiles-dir dbt_radar
+
+      # Полный текст вакансий Adzuna со страниц сайта: API обрезает описание
+      # на 500 символах. Ключи Adzuna не нужны — скрипт ходит на страницы по
+      # ссылкам, которые отдал API. Кандидаты — вакансии подборки без свежей
+      # проверки (fetch/adzuna_pages.py, RECHECK_AFTER_DAYS).
+      #
+      # timeout-minutes — страховка: обычный прогон идёт несколько минут
+      # (до 60 страниц, пауза 3 секунды), а при недоступном сайте повторы
+      # по каждой странице тянулись бы часами.
+      #
+      # continue-on-error: сбой скачивания не должен оставить без дайджеста.
+      # Например, если сайт ответит 403 на все запросы, скрипт завершится с
+      # кодом 1 — шаг будет отмечен в логе как упавший, но следующие шаги
+      # отработают по описаниям из API.
+      - name: Скачать полный текст вакансий Adzuna
+        timeout-minutes: 20
+        continue-on-error: true
+        env:
+          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+        run: python -m fetch.adzuna_pages
+
+      - name: Пересчитать модели dbt — скачанные страницы
+        env:
+          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+        run: |
+          dbt build \
+            --project-dir dbt_radar \
+            --profiles-dir dbt_radar
+
       # Обогащение языковой моделью: дописывает ответы Gemini в
-      # raw.llm_enrichment, а dbt build ниже подтягивает их в витрины.
+      # raw.llm_enrichment, а последний dbt build подтягивает их в витрины.
       # Нужны оба доступа: BigQuery — найти вакансии и записать ответы,
       # Gemini — спросить модель. GEMINI_API_KEY заводится там же, где
       # ключи Adzuna: Settings → Secrets and variables → Actions.
       #
-      # Кандидатов скрипт берёт из mart_vacancies_scored, а её dbt пересоберёт
-      # только в следующем шаге. Значит, вакансии, собранные сегодня,
-      # обогатятся при следующем прогоне.
+      # Кандидатов скрипт берёт из mart_vacancies_scored, пересобранной шагом
+      # выше: в ней уже сегодняшние вакансии и текст скачанных страниц.
       #
       # timeout-minutes — грубая страховка поверх предохранителя в скрипте
       # (MAX_CONSECUTIVE_FAILURES): если он не сработает из-за ошибки в нём
@@ -114,18 +176,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python -m enrich.with_gemini
 
-      # dbt стоит из requirements.txt (dbt-bigquery==1.12.0) — отдельно
-      # ставить не нужно, иначе версия окажется прописана в двух местах.
-      #
-      # --project-dir  — где лежит dbt_project.yml и папка models
-      # --profiles-dir — где лежит profiles.yml с подключением к BigQuery
-      # По умолчанию dbt ищет профиль в ~/.dbt/ — на раннере такой папки нет,
-      # поэтому показываем ему нашу.
-      #
-      # build = run + test: сначала пересобирает модель, сразу проверяет её
-      # тестами и только потом идёт к следующей. Если тест упал — дальше
-      # по цепочке не пойдёт, и битые данные не доедут до marts.
-      - name: Пересчитать модели dbt
+      - name: Пересчитать модели dbt — ответы модели
         env:
           BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
