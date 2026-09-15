@@ -1,10 +1,20 @@
-# Запуск сбора вакансий по расписанию — то, что заменяет нам сервер с Airflow.
-# Включим на первой неделе, когда коллектор заработает локально.
+# Утренний сбор вакансий по расписанию — то, что заменяет нам сервер с Airflow.
+# Отправка в Telegram — отдельный workflow digest.yml, в 12:00 UTC.
 #
 # Как читать этот файл:
 #   on       — когда запускать
-#   jobs     — что запускать
+#   env      — переменные, общие для всех шагов задачи
 #   steps    — по шагам, сверху вниз, как в терминале
+#
+# Секреты этого workflow (Settings → Secrets and variables → Actions):
+#   GCP_SA_KEY      — ключ сервисного аккаунта Google Cloud
+#   BQ_PROJECT      — id проекта в Google Cloud
+#   ADZUNA_APP_ID   — сбор adzuna
+#   ADZUNA_APP_KEY  — сбор adzuna
+#   GEMINI_API_KEY  — обогащение
+# Добавляешь шаг, которому нужен новый ключ, — заведи секрет, допиши его в
+# этот список и в env шага. Незаданный секрет приходит пустой строкой, и
+# ночной прогон упадёт.
 
 name: collect
 
@@ -20,28 +30,52 @@ jobs:
   collect:
     runs-on: ubuntu-latest
 
+    # Общие для всех шагов: id проекта и путь к ключу нужны каждому шагу,
+    # который ходит в BigQuery, — загрузке, dbt, скачиванию страниц, обогащению.
+    # Раньше они задавались в каждом шаге отдельно, и новый шаг легко было
+    # оставить без них. Секреты, которые нужны одному шагу (ключи Adzuna,
+    # Gemini, сам ключ сервисного аккаунта), — только в env своего шага: чем
+    # меньше шагов видят ключ, тем меньше мест, где он может утечь.
+    env:
+      BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+      GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+
+    # timeout-minutes у каждого шага — с запасом в несколько раз от обычной
+    # длительности (по прогону 15.09.2026). Без него зависший шаг держал бы
+    # раннер до лимита задачи по умолчанию — 6 часов.
     steps:
+      # v7 обеих actions работают на Node.js 24; v4 и v5 — на Node.js 20,
+      # который GitHub объявил устаревшим и выводил об этом предупреждение.
       - name: Забрать код репозитория
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        timeout-minutes: 5
 
       - name: Поставить Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
+        timeout-minutes: 5
         with:
           python-version: "3.11"
 
+      # Обычно полминуты.
       - name: Установить зависимости
+        timeout-minutes: 10
         run: pip install -r requirements.txt
 
+      # --- 1. Сбор из источников ---
+
       - name: Собрать вакансии (arbeitnow)
+        timeout-minutes: 10
         run: python -m collectors.arbeitnow
 
       - name: Собрать вакансии (remoteok)
+        timeout-minutes: 10
         run: python -m collectors.remoteok
 
-      # У adzuna, в отличие от остальных, есть ключи. Они лежат в
-      # Settings → Secrets and variables → Actions и подставляются
+      # У adzuna, в отличие от остальных, есть ключи. Они подставляются
       # только на время шага: в логах вместо значения будет ***.
+      # Обычно полторы минуты: 12 поисковых запросов и повторы при сбоях.
       - name: Собрать вакансии (adzuna)
+        timeout-minutes: 15
         env:
           ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
           ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
@@ -50,59 +84,64 @@ jobs:
       # remotive отключён: публичный API отдаёт всего 17 вакансий на весь рынок
       # и игнорирует параметр category, ни одной data-вакансии в выдаче нет.
       # Код коллектора и таблица в BigQuery остаются — если API починят,
-      # достаточно вернуть сюда два шага.
+      # достаточно вернуть сюда шаги сбора и загрузки.
       #
       # - name: Собрать вакансии (remotive)
+      #   timeout-minutes: 10
       #   run: python -m collectors.remotive
 
-      # Ключ лежит в Settings → Secrets and variables → Actions,
-      # в коде он никогда не появляется.
-      - name: Загрузить arbeitnow в BigQuery
-        env:
-          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
-        run: |
-          # printf '%s' безопаснее echo: не ломается на кавычках внутри ключа
-          # и не разворачивает escape-последовательности.
-          printf '%s' "$GCP_SA_KEY" > key.json
-          python -m load.to_bigquery arbeitnow
+      # --- 2. Загрузка в BigQuery ---
 
-      # key.json уже лежит в рабочей папке после предыдущего шага —
-      # секрет второй раз разворачивать не нужно. А вот env задаётся
-      # для каждого шага отдельно, он не наследуется.
-      - name: Загрузить remoteok в BigQuery
+      # Ключ сервисного аккаунта кладём в файл один раз, отдельным шагом: его
+      # читают все следующие шаги по пути из GOOGLE_APPLICATION_CREDENTIALS.
+      # Сам секрет GCP_SA_KEY виден только этому шагу.
+      # printf '%s' безопаснее echo: не ломается на кавычках внутри ключа
+      # и не разворачивает escape-последовательности.
+      - name: Положить ключ сервисного аккаунта
+        timeout-minutes: 2
         env:
-          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: printf '%s' "$GCP_SA_KEY" > key.json
+
+      - name: Загрузить arbeitnow в BigQuery
+        timeout-minutes: 5
+        run: python -m load.to_bigquery arbeitnow
+
+      - name: Загрузить remoteok в BigQuery
+        timeout-minutes: 5
         run: python -m load.to_bigquery remoteok
 
       # Ключи Adzuna здесь уже не нужны: загрузчик читает готовый файл
       # data/raw_adzuna.jsonl и в источник не ходит.
       - name: Загрузить adzuna в BigQuery
-        env:
-          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+        timeout-minutes: 5
         run: python -m load.to_bigquery adzuna
 
       # - name: Загрузить remotive в BigQuery
-      #   env:
-      #     BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
-      #     GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+      #   timeout-minutes: 5
       #   run: python -m load.to_bigquery remotive
 
-      # Дальше витрины пересчитываются трижды. Скачивание страниц и обогащение
-      # берут кандидатов из витрин, и каждому шагу нужны свежие данные
-      # предыдущего:
-      #   1. dbt build — сегодняшние вакансии попадают в подборку;
-      #   2. скачать страницы Adzuna — полный текст для вакансий подборки;
-      #   3. dbt build — текст страниц попадает в description_best, снятые
-      #      вакансии (код 404) выпадают из подборки;
-      #   4. обогатить через Gemini — уже по полному тексту;
-      #   5. dbt build — ответы модели попадают в баллы, подборку и дайджест.
-      # Без пересборки между 2 и 4 вакансия обогатилась бы по описанию из API,
-      # обрезанному на 500 символах, а второй раз обогащение её не взяло бы:
-      # ответ этой версии промпта у неё уже есть.
+      # --- 3. Витрины, страницы, обогащение ---
+      #
+      # dbt build здесь вызывается ТРИ раза, и это намеренно. Не объединять
+      # и не убирать «лишний».
+      #
+      # Скачивание страниц и обогащение берут кандидатов и текст из витрин —
+      # таблиц, которые обновляет только dbt build. Каждому шагу нужен
+      # результат предыдущего:
+      #   1. dbt build — решает, кто попал в подборку: сегодняшние вакансии
+      #      проходят правила, и из подборки fetch.adzuna_pages берёт кандидатов;
+      #   2. fetch.adzuna_pages — полный текст страниц Adzuna и коды ответа в raw;
+      #   3. dbt build — текст страниц попадает в description_best таблицы
+      #      mart_vacancies_scored, снятые вакансии (код 404) выпадают из подборки;
+      #   4. enrich.with_gemini — берёт кандидатов и description_best из этой
+      #      таблицы;
+      #   5. dbt build — собирает витрины с новым текстом и ответами модели:
+      #      баллы, правила по языкам и резидентству, очередь для digest.yml.
+      # Без сборки 3 вакансии Adzuna, скачанные в этот прогон, обогатились бы
+      # по описанию из API, обрезанному на 500 символах, — и второй раз их не
+      # обогатили бы: ответ этой версии промпта у них уже есть. Снятые
+      # вакансии вдобавок зря съели бы квоту модели.
       #
       # dbt стоит из requirements.txt (dbt-bigquery==1.12.0) — отдельно
       # ставить не нужно, иначе версия окажется прописана в двух местах.
@@ -115,10 +154,11 @@ jobs:
       # build = run + test: сначала пересобирает модель, сразу проверяет её
       # тестами и только потом идёт к следующей. Если тест упал — дальше
       # по цепочке не пойдёт, и битые данные не доедут до marts.
-      - name: Пересчитать модели dbt — сегодняшние вакансии
-        env:
-          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+      #
+      # Обычно сборка идёт полминуты; 15 минут — запас на медленный BigQuery.
+
+      - name: dbt build 1 из 3 — подборка из сегодняшних вакансий
+        timeout-minutes: 15
         run: |
           dbt build \
             --project-dir dbt_radar \
@@ -130,8 +170,8 @@ jobs:
       # проверки (fetch/adzuna_pages.py, RECHECK_AFTER_DAYS).
       #
       # timeout-minutes — страховка: обычный прогон идёт несколько минут
-      # (до 60 страниц, пауза 3 секунды), а при недоступном сайте повторы
-      # по каждой странице тянулись бы часами.
+      # (до 60 страниц, пауза 3 секунды, 8 минут 15.09.2026), а при
+      # недоступном сайте повторы по каждой странице тянулись бы часами.
       #
       # continue-on-error: сбой скачивания не должен оставить без дайджеста.
       # Например, если сайт ответит 403 на все запросы, скрипт завершится с
@@ -140,46 +180,32 @@ jobs:
       - name: Скачать полный текст вакансий Adzuna
         timeout-minutes: 20
         continue-on-error: true
-        env:
-          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
         run: python -m fetch.adzuna_pages
 
-      - name: Пересчитать модели dbt — скачанные страницы
-        env:
-          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+      - name: dbt build 2 из 3 — текст скачанных страниц в витринах
+        timeout-minutes: 15
         run: |
           dbt build \
             --project-dir dbt_radar \
             --profiles-dir dbt_radar
 
       # Обогащение языковой моделью: дописывает ответы Gemini в
-      # raw.llm_enrichment, а последний dbt build подтягивает их в витрины.
-      # Нужны оба доступа: BigQuery — найти вакансии и записать ответы,
-      # Gemini — спросить модель. GEMINI_API_KEY заводится там же, где
-      # ключи Adzuna: Settings → Secrets and variables → Actions.
-      #
-      # Кандидатов скрипт берёт из mart_vacancies_scored, пересобранной шагом
-      # выше: в ней уже сегодняшние вакансии и текст скачанных страниц.
+      # raw.llm_enrichment. Нужны оба доступа: BigQuery — найти вакансии и
+      # записать ответы, Gemini — спросить модель.
       #
       # timeout-minutes — грубая страховка поверх предохранителя в скрипте
       # (MAX_CONSECUTIVE_FAILURES): если он не сработает из-за ошибки в нём
-      # самом, GitHub прервёт шаг через 30 минут, а не через 6 часов — лимит
-      # задачи по умолчанию. Обычный прогон короче: ~13 секунд на вакансию,
-      # при потолке 100 кандидатов около 22 минут.
+      # самом, GitHub прервёт шаг через 30 минут, а не через 6 часов.
+      # Обычный прогон короче: ~7 секунд на вакансию, 2.4 минуты 15.09.2026;
+      # при потолке 100 кандидатов — около 13 минут.
       - name: Обогатить вакансии через Gemini
         timeout-minutes: 30
         env:
-          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python -m enrich.with_gemini
 
-      - name: Пересчитать модели dbt — ответы модели
-        env:
-          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+      - name: dbt build 3 из 3 — ответы модели, баллы и очередь на отправку
+        timeout-minutes: 15
         run: |
           dbt build \
             --project-dir dbt_radar \
