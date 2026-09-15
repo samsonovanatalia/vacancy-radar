@@ -21,6 +21,7 @@ import io
 import json
 import os
 import re
+import sys
 import unittest
 from unittest import mock
 
@@ -157,9 +158,12 @@ class SendDigestTest(unittest.TestCase):
         self.requests_by_scenario[scenario] = attempt + 1
         return respond(outcomes[min(attempt, len(outcomes) - 1)])
 
-    def run_send(self, queue: list[dict]) -> tuple[str, str | None]:
+    def run_send(
+        self, queue: list[dict], limit: int | None = None, catch_up: bool = False
+    ) -> tuple[str, str | None]:
         """Один запуск бота. Возвращает лог и сообщение SystemExit (None — код 0).
 
+        limit и catch_up — то, что пришло бы из командной строки.
         fetch_queue отдаёт очередь без вакансий, уже записанных в self.saved.
         """
         recorded = {key for key, _ in self.saved}
@@ -168,7 +172,7 @@ class SendDigestTest(unittest.TestCase):
         with mock.patch.object(tg, "fetch_queue", lambda bq, project: remaining), \
                 contextlib.redirect_stdout(log):
             try:
-                tg.send_digest()
+                tg.send_digest(limit, catch_up)
             except SystemExit as stop:
                 return log.getvalue(), stop.code
         return log.getvalue(), None
@@ -242,6 +246,8 @@ class SendDigestTest(unittest.TestCase):
         self.assertIn("итог: в очереди 2, отправляли 2: доставлено 2, недоставляемых 0, сбоев 0; "
                       "шапка доставлена; осталось в очереди 0", log)
         self.assertNotIn(TOKEN, log)
+        # Пауза 1.5 с — после шапки и после каждой вакансии.
+        self.assertEqual(self.sleeps, [1.5, 1.5, 1.5])
 
     def test_one_message_fails(self) -> None:
         """Временный сбой на одном сообщении: остальные доставлены, сбойная не записана."""
@@ -345,6 +351,71 @@ class SendDigestTest(unittest.TestCase):
         self.assertIn("сегодня новых вакансий нет", self.texts()[-1])
         # Ничего не потеряно и ничего не задвоено: каждая вакансия записана один раз, как sent.
         self.assertCountEqual(self.saved, [(vacancy["vacancy_key"], "sent") for vacancy in queue])
+
+    # --- догоняющий прогон ---
+
+    def test_catch_up_sends_whole_queue(self) -> None:
+        """С --catch-up потолок снят: уходит вся очередь, в логе отдельная строка с числом."""
+        size = tg.MAX_PER_RUN + 10
+        queue = [make_vacancy(f"ok#{i}") for i in range(size)]
+        log, exit_message = self.run_send(queue, catch_up=True)
+
+        self.assertIsNone(exit_message, log)
+        # Очередь целиком — в шапке нет ни «из», ни «остальные завтра».
+        self.assertRegex(self.texts()[0], rf"^<b>Дайджест за \d\d\.\d\d\.\d{{4}}</b>, вакансий: {size}$")
+        self.assertEqual(self.saved, [(f"test:ok#{i}", "sent") for i in range(size)])
+        self.assertIn(f"догоняющий прогон: потолок MAX_PER_RUN = {tg.MAX_PER_RUN} снят, "
+                      f"отправляем {size} из {size}", log)
+        self.assertIn("осталось в очереди 0", log)
+        # Пауза после шапки и после каждой вакансии: темп держится и на длинной серии.
+        self.assertEqual(self.sleeps, [tg.PAUSE_SECONDS] * (size + 1))
+
+    def test_without_catch_up_limit_applies(self) -> None:
+        """Без флага потолок действует, даже если число в командной строке больше."""
+        size = tg.MAX_PER_RUN + 10
+        queue = [make_vacancy(f"ok#{i}") for i in range(size)]
+        log, exit_message = self.run_send(queue, limit=size)
+
+        self.assertIsNone(exit_message, log)
+        self.assertEqual(self.saved, [(f"test:ok#{i}", "sent") for i in range(tg.MAX_PER_RUN)])
+        self.assertIn(f"вакансий: {tg.MAX_PER_RUN} из {size}, остальные завтра", self.texts()[0])
+        # Урезали не молча: в логе сказано, почему не size и как поднять.
+        self.assertIn("поднять потолок можно только флагом --catch-up", log)
+        self.assertNotIn("догоняющий прогон", log)
+
+    def test_batch_limit(self) -> None:
+        """Число опускает лимит всегда, поднимает — только вместе с --catch-up."""
+        limit = tg.MAX_PER_RUN
+        cases = [
+            # (число, --catch-up, сколько отправить; None — всю очередь)
+            (None, False, limit),
+            (5, False, 5),
+            (limit + 15, False, limit),
+            (None, True, None),
+            (5, True, 5),
+            (limit + 15, True, limit + 15),
+        ]
+        for number, catch_up, expected in cases:
+            with self.subTest(limit=number, catch_up=catch_up):
+                self.assertEqual(tg.batch_limit(number, catch_up), expected)
+
+    def test_read_args(self) -> None:
+        """Командная строка: число, флаг --catch-up в любом порядке; ноль — ошибка."""
+        cases = [
+            ([], None, False),
+            (["5"], 5, False),
+            (["--catch-up"], None, True),
+            (["40", "--catch-up"], 40, True),
+            (["--catch-up", "40"], 40, True),
+        ]
+        for argv, limit, catch_up in cases:
+            with self.subTest(argv=argv), mock.patch.object(sys, "argv", ["notify.telegram", *argv]):
+                args = tg.read_args()
+                self.assertEqual((args.limit, args.catch_up), (limit, catch_up))
+        # parser.error печатает подсказку в stderr и выходит — прячем её из вывода тестов.
+        with mock.patch.object(sys, "argv", ["notify.telegram", "0"]), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            tg.read_args()
 
     # --- undeliverable ---
 
