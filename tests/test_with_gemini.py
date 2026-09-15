@@ -39,6 +39,7 @@ ANSWER = {
     "location_city": None, "location_country": None, "residency_requirement": None,
     "salary_min": None, "salary_max": None, "salary_currency": None, "salary_period": None,
     "application_deadline": None, "benefits": [], "language": "en",
+    "required_languages": [], "residency_years_required": None,
 }
 
 # Сценарий — ответы на попытки по одной вакансии по порядку; когда список

@@ -9,7 +9,8 @@
   2. По каждой отправляет в Gemini известные поля (заголовок, компания,
      город, зарплата — то, что источник отдал отдельными полями) и описание
      и просит вернуть факты строго по JSON-схеме: суть, обязанности,
-     требования, стек, режим работы, город, требование к резидентству, зарплату.
+     требования, стек, режим работы, город, требование к резидентству и
+     сколько лет проживания оно требует, требуемые языки, зарплату.
   3. Дописывает ответы в raw.llm_enrichment. Дальше их читает dbt:
      stg_enrichment → mart_vacancies_scored.
 
@@ -140,7 +141,11 @@ BATCH_SIZE = 10
 #   v4 — description_best вместо description_clean: полный текст со
 #        страницы вакансии, если он скачан (Adzuna), иначе описание из API.
 #        Текст промпта не менялся.
-PROMPT_VERSION = "v4"
+#   v5 — два новых поля: required_languages (какие языки требуются и на
+#        каком уровне) и residency_years_required (сколько лет проживания
+#        в стране требуют). Правил исключения по ним пока нет — сначала
+#        смотрим, что модель находит.
+PROMPT_VERSION = "v5"
 
 PROMPT = """\
 You extract facts from a job posting. You receive a "Known fields" block
@@ -180,6 +185,20 @@ Rules:
 - residency_requirement: copy verbatim the sentence that requires the
   candidate to live in, be based in, or have the right to work in a specific
   country or region. null if there is no such requirement.
+- residency_years_required: how many years the candidate must have lived in
+  a country, as a number: "resident in Spain for the last 5 consecutive
+  years" -> 5. Months as a fraction of a year: 18 months -> 1.5. Only an
+  explicit length of residence counts: "must be based in Spain" or "right to
+  work in the EU" -> null. No such requirement -> null.
+- required_languages: languages the candidate must speak, only when the
+  posting states them as a requirement ("fluent Spanish", "German C1 is a
+  must", "native-level French"). A language that is only mentioned is not a
+  requirement: "we are an international team", "our office is multilingual".
+  The language the posting is written in is not a requirement by itself.
+  "Nice to have" or "is a plus" is not a requirement either. For each
+  language: language as an ISO 639-1 code (es, de, en); level copied as
+  written in the posting ("C1", "fluent", "native", "business level"), null
+  if no level is given. No language requirements -> empty list.
 - salary_min, salary_max: numbers only, from the known fields or the
   description (50k = 50000). Never estimate a salary that is not written.
   salary_currency: ISO 4217 code (EUR, GBP, USD). salary_period: year,
@@ -233,6 +252,23 @@ FIELDS = {
     "application_deadline": {"type": "STRING", "nullable": True},
     "benefits": {"type": "ARRAY", "items": {"type": "STRING"}, "max_items": 6},
     "language": {"type": "STRING"},
+    # Поля v5. Список объектов, а не строк вида «Spanish C1»: язык и уровень
+    # лежат в разных полях, и будущему правилу исключения не придётся
+    # разбирать строку. Уровень — как написан в вакансии: «C1», «fluent»,
+    # «native» — сводить их к одной шкале пока рано.
+    "required_languages": {
+        "type": "ARRAY",
+        "items": {
+            "type": "OBJECT",
+            "properties": {
+                "language": {"type": "STRING"},
+                "level": {"type": "STRING", "nullable": True},
+            },
+            "required": ["language", "level"],
+        },
+    },
+    # NUMBER, а не INTEGER: требование бывает в месяцах, 18 месяцев — 1.5 года.
+    "residency_years_required": {"type": "NUMBER", "nullable": True},
 }
 
 RESPONSE_SCHEMA = {
@@ -275,6 +311,18 @@ TABLE_SCHEMA = [
     bigquery.SchemaField("model_name", "STRING", mode="REQUIRED"),
     bigquery.SchemaField("prompt_version", "STRING", mode="REQUIRED"),
     bigquery.SchemaField("enriched_at", "TIMESTAMP", mode="REQUIRED"),
+    # Поля v5 — в конце, а не рядом с остальными ответами модели: в таблицу,
+    # которая уже есть, ensure_table дописывает колонки в конец, и так новая
+    # таблица не отличается от старой. REPEATED RECORD — список записей
+    # {language, level}.
+    bigquery.SchemaField(
+        "required_languages", "RECORD", mode="REPEATED",
+        fields=[
+            bigquery.SchemaField("language", "STRING"),
+            bigquery.SchemaField("level", "STRING"),
+        ],
+    ),
+    bigquery.SchemaField("residency_years_required", "FLOAT64"),
 ]
 
 
@@ -331,16 +379,36 @@ def read_args() -> argparse.Namespace:
 
 
 def ensure_table(bq: bigquery.Client, table_id: str) -> None:
-    """Создаёт raw.llm_enrichment с явной схемой, если таблицы ещё нет.
+    """Создаёт raw.llm_enrichment с явной схемой, если таблицы ещё нет, и дописывает недостающие колонки.
 
     Создаём заранее, а не при первой записи, по двум причинам: запрос
     кандидатов ниже обращается к этой таблице, а dbt-модель stg_enrichment
     упадёт, если таблицы нет, — даже когда обогащать сегодня было нечего.
+
+    Колонки дописываем, когда в промпт добавляются поля (v5 —
+    required_languages и residency_years_required). create_table с
+    exists_ok=True существующую таблицу не меняет, а загрузка строк с новыми
+    полями в таблицу без этих колонок упала бы.
     """
     table = bigquery.Table(table_id, schema=TABLE_SCHEMA)
     # Партиция по дню обогащения — так же, как raw-таблицы вакансий по ingested_at.
     table.time_partitioning = bigquery.TimePartitioning(field="enriched_at")
-    bq.create_table(table, exists_ok=True)
+    # Если таблица уже есть, create_table вернёт её как есть — со старой схемой.
+    table = bq.create_table(table, exists_ok=True)
+
+    existing = {field.name for field in table.schema}
+    missing = [field for field in TABLE_SCHEMA if field.name not in existing]
+    if missing:
+        # Здесь, а не отдельным sql-скриптом, как у raw.digest_sent: эту таблицу
+        # создаёт и знает её схему сам скрипт, пусть он её и достраивает.
+        # BigQuery даёт дописать в существующую таблицу только необязательные
+        # (NULLABLE) и списочные (REPEATED) колонки — новые поля такие и есть.
+        # У строк, записанных раньше, в них null и пустой список. Меняется
+        # только схема, записанные строки остаются как были.
+        table.schema = [*table.schema, *missing]
+        bq.update_table(table, ["schema"])
+        added = ", ".join(field.name for field in missing)
+        print(f"в {RAW_DATASET}.{TABLE_NAME} добавлены колонки: {added}", flush=True)
 
 
 def fetch_candidates(

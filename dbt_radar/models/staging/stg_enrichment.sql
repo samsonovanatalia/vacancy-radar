@@ -38,6 +38,13 @@ with enrichment as (
 
         benefits,
         lower(language)                             as language,
+
+        -- Поля промпта v5. У ответов старых версий их нет: residency_years_required
+        -- там null, required_languages — пустой список (null в REPEATED-колонке
+        -- BigQuery отдаёт пустым списком). Регистр кода языка пока не приводим:
+        -- сначала смотрим, что модель возвращает, правила — потом.
+        required_languages,
+        residency_years_required,
         model_name,
         prompt_version,
         enriched_at
