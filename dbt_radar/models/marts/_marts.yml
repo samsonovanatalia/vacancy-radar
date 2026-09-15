@@ -25,7 +25,7 @@ models:
 
   - name: mart_vacancies_scored
     description: >
-      Все вакансии за последние 14 дней с признаками, причиной исключения
+      Все вакансии за последние 30 дней с признаками, причиной исключения
       и баллом релевантности. Одна строка = одна вакансия. Ничего не
       выбрасывает: отсеянные строки остаются с заполненным excluded_reason,
       чтобы решения фильтра можно было сверить с ручной разметкой.
@@ -41,7 +41,7 @@ models:
         tests:
           - not_null
       - name: posted_at
-        description: "Дата публикации. Не старше 14 дней на момент сборки."
+        description: "Дата публикации. Не старше 30 дней на момент сборки."
         tests:
           - not_null
       - name: role_type
@@ -99,22 +99,45 @@ models:
           по location_fit, +3 / −5 за fits_location yes / no, −2 за senior,
           +1 за указанную зарплату.
 
-  - name: mart_digest_daily
+  - name: mart_digest_queue
     description: >
-      Ежедневный дайджест: до 10 лучших вакансий с фактами от языковой модели.
-      Одна строка = одна вакансия, отобранная в дайджест. Отбор: excluded_reason
-      is null, вакансия не помечена мёртвой (stg_vacancy_pages.is_dead),
-      опубликована не раньше 7 дней назад. Порядок: relevance_score по
-      убыванию, при равном балле обогащённые выше, потом posted_at по убыванию.
-      Необогащённая вакансия остаётся, поля модели у неё пустые.
+      Очередь на отправку в Telegram: все подходящие вакансии, у которых ещё нет
+      исхода отправки. Одна строка = одна вакансия в очереди. Отбор:
+      excluded_reason is null; вакансия не помечена мёртвой
+      (stg_vacancy_pages.is_dead); жива — у Adzuna последняя успешная проверка
+      страницы не старше 3 дней, у остальных источников дата публикации не
+      старше 30 дней; бот её не отправлял и не признавал недоставляемой
+      (stg_digest_sent). Число строк не ограничено: сколько отправить за раз,
+      решает бот (MAX_PER_RUN в notify/telegram.py), остальное ждёт следующего
+      запуска. Необогащённая вакансия остаётся, поля модели у неё пустые.
     columns:
       - name: vacancy_key
         description: "Ключ вакансии: source + ':' + source_id. Грейн витрины."
         tests:
           - not_null
           - unique
+      - name: queue_position
+        description: >
+          Номер в очереди, 1 — отправить первой. Порядок: relevance_score по
+          убыванию, при равном балле обогащённые выше, потом posted_at по
+          убыванию, потом vacancy_key.
+        tests:
+          # unique: два одинаковых номера — и порядок отправки между ними
+          # решал бы случай.
+          - not_null
+          - unique
       - name: posted_at
-        description: "Дата публикации. Не старше 7 дней на момент сборки."
+        description: "Дата публикации."
+      - name: liveness_basis
+        description: >
+          На чём основано решение, что вакансия жива: checked — страницу
+          успешно проверили не раньше 3 дней назад; assumed_by_date — проверять
+          нечем, вакансия опубликована не раньше 30 дней назад.
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['checked', 'assumed_by_date']
       - name: title
         tests:
           - not_null
@@ -150,8 +173,9 @@ models:
 
   - name: mart_vacancies_for_me
     description: >
-      Подборка вакансий под мой профиль: то, что бот отправляет в 12:00.
-      Одна строка = одна вакансия. View поверх mart_vacancies_scored:
+      Подборка вакансий под мой профиль. Из неё скачиваются страницы Adzuna,
+      а очередь на отправку в Telegram (mart_digest_queue) строится по тем же
+      правилам. Одна строка = одна вакансия. View поверх mart_vacancies_scored:
       только строки, где excluded_reason is null.
     columns:
       - name: vacancy_key
@@ -168,7 +192,7 @@ models:
         tests:
           - not_null
       - name: posted_at
-        description: "Дата публикации. Не старше 14 дней на момент сборки."
+        description: "Дата публикации. Не старше 30 дней на момент сборки."
         tests:
           - not_null
       - name: relevance_score
