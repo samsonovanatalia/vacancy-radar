@@ -77,6 +77,11 @@ models:
         description: "Код ответа последней попытки; null — ответа не было (сетевая ошибка, пропуск /land/ad/)."
       - name: is_dead
         description: "true, если последняя попытка вернула 404. Нет ответа — false: не проверили, а не сняли."
+      - name: last_checked_at
+        description: >
+          Время последней успешной проверки — по всем попыткам, не только по
+          последней. Успешная — код 200 с текстом страницы или код 404.
+          null — успешных проверок не было.
       - name: page_text_clean
         description: >
           Полный текст со страницы, очищенный макросом clean_html_text — так же,
@@ -97,3 +102,32 @@ models:
           - not_null
       - name: application_deadline
         description: "Дата из ответа модели; null, если даты нет или она не разобралась."
+
+  - name: stg_digest_sent
+    description: >
+      Вакансии, у которых уже есть исход отправки в Telegram: доставлена или
+      недоставляемая. Одна строка = одна вакансия: если доставка была, берётся
+      первая доставка, иначе первая запись undeliverable.
+    columns:
+      - name: vacancy_key
+        description: "Ключ вакансии, тот же, что в stg_vacancies."
+        tests:
+          # unique сторожит и очередь: mart_digest_queue сверяется с этой
+          # моделью, и дубль здесь не должен ничего размножить.
+          - unique
+          - not_null
+      - name: status
+        description: >
+          sent — Telegram подтвердил доставку; undeliverable — Telegram отказал
+          с кодом 400, повторять бессмысленно. null в raw (строки, записанные
+          до появления колонки) читается как sent.
+        tests:
+          - not_null
+          # Бот запишет что-то третье — тест упадёт, а не молча примет.
+          - accepted_values:
+              arguments:
+                values: ['sent', 'undeliverable']
+      - name: sent_at
+        description: "Когда записан выбранный исход: время доставки или отказа Telegram."
+        tests:
+          - not_null

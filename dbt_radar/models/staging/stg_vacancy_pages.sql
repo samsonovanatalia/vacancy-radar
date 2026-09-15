@@ -25,6 +25,23 @@ with pages as (
         -- «не проверили», а не «снята», поэтому false.
         coalesce(http_status = 404, false)                  as is_dead,
 
+        -- Когда вакансию последний раз УСПЕШНО проверили. Успешная проверка —
+        -- окончательный ответ: код 200 с текстом страницы или код 404. То же
+        -- определение, что в fetch/adzuna_pages.py: 403, таймаут и сетевая
+        -- ошибка о живости вакансии ничего не говорят.
+        --
+        -- Оконная функция, а не колонка последней попытки: последней может
+        -- оказаться 403, а успешная проверка — вчерашней. max по всем попыткам
+        -- вакансии (partition by vacancy_key) её найдёт, а qualify ниже всё
+        -- равно оставит одну строку.
+        -- if(...) даёт null у неуспешных попыток, max их пропускает. Успешных
+        -- не было вовсе — last_checked_at null.
+        max(if(
+            (http_status = 200 and page_text is not null) or http_status = 404,
+            fetched_at,
+            null
+        )) over (partition by vacancy_key)                  as last_checked_at,
+
         -- Та же чистка, что у description_clean в stg_vacancies: макрос
         -- macros/clean_html_text.sql. page_text заполнен только у живой
         -- страницы (код 200 и разметка JobPosting); у остальных попыток он
