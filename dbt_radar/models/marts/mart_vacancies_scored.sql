@@ -21,15 +21,17 @@
 
 with enrichment as (
 
-    -- Факты от языковой модели. Берём только то, что нужно правилу
-    -- fits_location, и добавляем префикс llm_: у нас уже есть своя
-    -- seniority по заголовку, и без префикса колонки модели путались бы
-    -- с нашими признаками.
+    -- Факты от языковой модели. Берём только то, что нужно правилам
+    -- fits_location, foreign_language_required и residency_too_long, и
+    -- добавляем префикс llm_: у нас уже есть своя seniority по заголовку, и
+    -- без префикса колонки модели путались бы с нашими признаками.
     select
         vacancy_key,
         work_mode                                   as llm_work_mode,
         location_city                               as llm_location_city,
         residency_requirement                       as llm_residency_requirement,
+        required_languages                          as llm_required_languages,
+        residency_years_required                    as llm_residency_years_required,
         enriched_at                                 as llm_enriched_at
     from {{ ref('stg_enrichment') }}
 
@@ -212,7 +214,27 @@ features as (
         -- в подборке нет — «Sales Analyst» и похожие уже исключает irrelevant_role.
         regexp_contains(title_normalized,
             r'\b(account executive|sales|business development|account manager|customer success|recruiter)\b')
-                                                        as is_non_data_title
+                                                        as is_non_data_title,
+
+        -- Требуется язык, кроме английского (поле промпта v5). Уровень не
+        -- смотрим: «будет плюсом» модель в список не берёт, так что сам факт
+        -- попадания языка в список уже значит требование. Английский не
+        -- проверяем вовсе: на 15.09.2026 он есть в 22 списках из 23, отсекать
+        -- им нечего.
+        -- lower: модель просили код ISO 639-1, но «EN» и «en» не должны
+        -- разойтись. Обогащения нет — llm_required_languages null, unnest
+        -- даёт ноль строк, и exists честно возвращает false, а не null.
+        exists (
+            select 1
+            from unnest(llm_required_languages) as l
+            where lower(l.language) != 'en'
+        )                                               as is_foreign_language_required,
+
+        -- Требуют больше года проживания в стране (поле промпта v5).
+        -- coalesce: требования нет или обогащения нет — сравнение даёт null,
+        -- а нужен честный false. Иначе null в сортировке дедупа ниже встал бы
+        -- раньше false и сдвинул бы, какая копия вакансии остаётся.
+        coalesce(llm_residency_years_required > 1, false) as is_residency_too_long
 
     from vacancies
 
@@ -277,6 +299,16 @@ ranked as (
         -- Первые ключи сортировки — «вакансию всё равно исключит другое
         -- правило»: сначала мёртвая ли она, потом исключённые грейд, язык и
         -- заголовок не про данные.
+        --
+        -- Правил по ответам модели (foreign_language_required,
+        -- residency_too_long) здесь нет намеренно. Модель обогащает только
+        -- вакансии из подборки, то есть победителя дедупа; у его копий ответа
+        -- нет, и флаг у них всегда false. Поставь флаг в сортировку — и
+        -- обогащённая копия с требованием языка проиграет необогащённой: та
+        -- займёт её место в подборке без проверки, а у первой причиной станет
+        -- duplicate вместо настоящей. Так и вышло при первой сборке с этими
+        -- правилами 15.09.2026: из 4 вакансий с требованием языка 3 ушли как
+        -- duplicate, а их непроверенные копии встали в очередь.
         -- false сортируется раньше true, поэтому живые кандидаты идут первыми.
         -- Без этого свежая «Data Engineer (m/w/d)» получила бы номер 1 (и ушла
         -- как not_english), а более старая английская «Data Engineer» —
@@ -341,7 +373,11 @@ select
     llm_work_mode,
     llm_location_city,
     llm_residency_requirement,
+    llm_required_languages,
+    llm_residency_years_required,
     fits_location,
+    is_foreign_language_required,
+    is_residency_too_long,
 
     -- Первое сработавшее правило. Если не сработало ни одно, case без else
     -- вернёт null — это и значит «вакансия проходит в подборку».
@@ -350,8 +386,13 @@ select
     -- скачанной страницы is_dead null: when null не срабатывает, как false.
     --
     -- non_data_role — заголовок продаж, работы с клиентами или найма
-    -- (is_non_data_title). Последним, чтобы у остальных вакансий причина
+    -- (is_non_data_title). После dead, чтобы у остальных вакансий причина
     -- исключения не поменялась.
+    --
+    -- foreign_language_required и residency_too_long — правила по полям
+    -- промпта v5 (is_foreign_language_required, is_residency_too_long). В конец
+    -- по той же причине: у вакансий, которые уже исключало другое правило,
+    -- причина остаётся прежней.
     case
         when seniority in ('lead', 'junior')    then 'wrong_seniority'
         when not is_english                     then 'not_english'
@@ -359,6 +400,8 @@ select
         when role_type = 'other'                then 'irrelevant_role'
         when is_dead                            then 'dead'
         when is_non_data_title                  then 'non_data_role'
+        when is_foreign_language_required       then 'foreign_language_required'
+        when is_residency_too_long              then 'residency_too_long'
     end                                                 as excluded_reason,
 
     -- Балл считаем для всех строк, в том числе исключённых: так при сверке

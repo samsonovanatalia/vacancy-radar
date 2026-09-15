@@ -85,13 +85,36 @@ models:
         description: >
           Подходит ли локация по фактам от модели: yes / no / unclear.
           null — обогащения ещё нет, балл считается без этого признака.
+      - name: llm_required_languages
+        description: >
+          Языки, которые вакансия называет требованием, по ответу модели
+          (промпт v5): записи language (ISO 639-1) и level. Пусто — требований
+          нет или вакансия не обогащена.
+      - name: llm_residency_years_required
+        description: >
+          Сколько лет проживания в стране требует вакансия, по ответу модели
+          (промпт v5). null — требования нет или вакансия не обогащена.
+      - name: is_foreign_language_required
+        description: >
+          В llm_required_languages есть хоть один язык с кодом, отличным от en.
+          Уровень не учитывается, английский не учитывается вовсе. false —
+          таких языков нет или вакансия не обогащена. Такая вакансия
+          исключается как foreign_language_required.
+      - name: is_residency_too_long
+        description: >
+          llm_residency_years_required больше 1. false — год и меньше, требования
+          нет или вакансия не обогащена. Такая вакансия исключается как
+          residency_too_long.
       - name: excluded_reason
         description: >
           Первое сработавшее правило: wrong_seniority → not_english →
           duplicate (компания + title_core) → irrelevant_role →
           dead (страница вакансии отдала 404, см. stg_vacancy_pages) →
-          non_data_role (заголовок продаж, работы с клиентами или найма).
-          null — вакансия проходит в подборку.
+          non_data_role (заголовок продаж, работы с клиентами или найма) →
+          foreign_language_required (модель нашла требование языка, кроме
+          английского, см. is_foreign_language_required) →
+          residency_too_long (требуют больше года проживания в стране, см.
+          is_residency_too_long). null — вакансия проходит в подборку.
       - name: relevance_score
         description: >
           Эвристика релевантности: за роль +4 analytics_engineer, +3 analyst,
