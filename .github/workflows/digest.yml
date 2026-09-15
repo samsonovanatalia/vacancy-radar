@@ -1,0 +1,69 @@
+# Отправка дайджеста в Telegram по расписанию: первые MAX_PER_RUN вакансий
+# очереди mart_digest_queue (notify/telegram.py). Очередь собирает collect.yml
+# в 06:00 UTC, отправка — в 12:00 UTC (14:00 в Барселоне летом, 13:00 зимой).
+#
+# Отдельный workflow, а не последний шаг collect.yml: так сбор и отправка
+# падают и перезапускаются независимо. Упал сбор — дайджест всё равно уйдёт
+# по вчерашней очереди или скажет «новых вакансий нет»; упала отправка — её
+# можно перезапустить руками, не пересобирая всё с утра.
+#
+# Секреты этого workflow (Settings → Secrets and variables → Actions):
+#   GCP_SA_KEY          — ключ сервисного аккаунта Google Cloud
+#   BQ_PROJECT          — id проекта в Google Cloud
+#   TELEGRAM_BOT_TOKEN  — токен бота
+#   TELEGRAM_CHAT_ID    — чат, куда слать
+# BigQuery нужен и здесь: бот читает очередь и пишет исходы в raw.digest_sent.
+# Добавляешь шаг, которому нужен новый ключ, — заведи секрет, допиши его в
+# этот список и в env шага.
+
+name: digest
+
+on:
+  schedule:
+    - cron: "0 12 * * *"
+  # Запуск вручную кнопкой на вкладке Actions.
+  workflow_dispatch:
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+
+    # Общие для всех шагов, как в collect.yml: id проекта и путь к ключу.
+    env:
+      BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+      GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/key.json
+
+    steps:
+      - name: Забрать код репозитория
+        uses: actions/checkout@v7
+        timeout-minutes: 5
+
+      - name: Поставить Python
+        uses: actions/setup-python@v7
+        timeout-minutes: 5
+        with:
+          python-version: "3.11"
+
+      - name: Установить зависимости
+        timeout-minutes: 10
+        run: pip install -r requirements.txt
+
+      # Секрет GCP_SA_KEY виден только этому шагу; остальные читают ключ из файла.
+      - name: Положить ключ сервисного аккаунта
+        timeout-minutes: 2
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: printf '%s' "$GCP_SA_KEY" > key.json
+
+      # Без флагов: обычный прогон, не больше MAX_PER_RUN вакансий. --catch-up в
+      # расписание не ставим — догоняющий прогон разовый и запускается руками.
+      #
+      # timeout-minutes: обычный прогон — пара минут; 20 — запас на повторы при
+      # 429 и 5xx. Прервётся по таймауту — вакансии не пропадут: исход записан
+      # только у отправленных, остальные уйдут в следующий раз.
+      - name: Отправить дайджест в Telegram
+        timeout-minutes: 20
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m notify.telegram
