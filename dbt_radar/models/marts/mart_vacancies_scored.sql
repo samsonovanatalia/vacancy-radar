@@ -84,6 +84,12 @@ vacancies as (
             ))
         ), 0)                                           as english_marker_share,
 
+        -- Название компании к общему виду — вторая половина ключа дедупа.
+        -- Правило вынесено в макрос: «что такое одна и та же компания»
+        -- должно жить в одном месте. Подробности и что он НЕ делает —
+        -- в macros/normalize_company_name.sql.
+        {{ normalize_company_name('company_name') }}    as company_core,
+
         -- Ядро заголовка для дедупа — всё до первого разделителя:
         -- «Data Engineer - Payments (m/w/d)» → «data engineer».
         -- Шаги изнутри наружу:
@@ -94,12 +100,38 @@ vacancies as (
         --      Разделители: дефис с пробелом рядом, –, —, |, запятая, «(».
         --      Дефис ВНУТРИ слова разделителем не считаем: иначе
         --      «AI-Native Data Engineer» превратился бы в «ai»;
-        --   3. схлопнуть пробелы в один и обрезать края.
+        --   3. схлопнуть пробелы в один и обрезать края;
+        --   4. снять два хвоста, которые приклеены БЕЗ разделителя и потому
+        --      шаг 2 их не достаёт (добавлено 2026-09-20):
+        --        — город или страна в конце: «Senior Marketing Data Analyst
+        --          Barcelona» и «...Barcelona, Spain» (запятую уже срезал
+        --          шаг 2) — это одна вакансия Zynga в двух записях;
+        --        — маркер пола вне скобок: «Business Director H/F - CDI»
+        --          против «Business Director - (F/H) - CDI». В скобках его
+        --          снимает шаг 2, без скобок — нет.
+        --      Оба списка закрытые и короткие НАМЕРЕННО. Широкую склейку
+        --      «один заголовок — начало другого» мы не делаем: из 11 таких
+        --      пар в данных настоящих дублей меньше половины, а «Applied
+        --      Scientist» и «Applied Scientist II» — разные вакансии.
+        --      Ложная склейка прячет вакансию навсегда (она уйдёт как
+        --      duplicate), пропущенный дубль стоит одного лишнего сообщения.
         -- title_normalized из staging уже в нижнем регистре.
         trim(regexp_replace(
             regexp_replace(
-                regexp_replace(title_normalized, r'^\s*\([^)]*\)', ''),
-                r'(\s-|-\s|[–—|,(]).*$', ''
+                regexp_replace(
+                    regexp_replace(
+                        regexp_replace(title_normalized, r'^\s*\([^)]*\)', ''),
+                        r'(\s-|-\s|[–—|,(]).*$', ''
+                    ),
+                    -- маркер пола: h/f, f/h, m/f, f/m, m/w/d, w/m/d, m/f/d,
+                    -- f/m/d, d/m/w. Пробелы внутри допускаем — «m / w / d».
+                    r'\s+[mwfd](\s*/\s*[mwfd]){1,2}\s*$', ''
+                ),
+                -- город или страна в конце. Список — города, по которым мы
+                -- вообще ищем, плюс Испания и «spain». Не «любое последнее
+                -- слово»: так «Data Analyst Insurance» осталось бы «data
+                -- analyst» и склеилось с чужой вакансией.
+                r'\s+(barcelona|madrid|valencia|sevilla|bilbao|malaga|zaragoza|spain|espana|españa)\s*$', ''
             ),
             r'\s+', ' '
         ))                                              as title_core
@@ -323,8 +355,14 @@ ranked as (
         --
         -- vacancy_key в конце — чтобы при одинаковом posted_at результат
         -- не менялся от прогона к прогону.
+        -- company_core вместо lower(company_name) с 2026-09-20: «Gartner»
+        -- и «Gartner, Inc.» — одна компания. Для компании, от которой после
+        -- нормализации не осталось ничего, company_core равен null; в
+        -- partition by все null попадают в ОДНУ группу, поэтому подстрахованы
+        -- coalesce на исходное название — иначе такие вакансии схлопнулись
+        -- бы между собой.
         row_number() over (
-            partition by lower(company_name), title_core
+            partition by coalesce(company_core, lower(company_name)), title_core
             order by
                 coalesce(is_dead, false),
                 (seniority in ('lead', 'junior') or not is_english or is_non_data_title),
@@ -346,6 +384,9 @@ select
     title_normalized,
     title_core,
     company_name,
+    -- Нормализованное название — вторая половина ключа дедупа. В подборку
+    -- не идёт, но без него не разобрать, почему две вакансии слиплись.
+    company_core,
     location,
     is_remote,
     salary_min,
