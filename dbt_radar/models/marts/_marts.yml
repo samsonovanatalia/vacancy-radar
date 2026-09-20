@@ -46,10 +46,13 @@ models:
           - not_null
       - name: role_type
         description: "analytics_engineer / product_analyst / analyst / data_engineer / other — по заголовку."
-      - name: title_core
+      - name: title_key
         description: >
-          Ядро заголовка для дедупа: без начальной скобки, обрезано до первого
-          разделителя (дефис с пробелом, –, —, |, запятая, «(»), нижний регистр.
+          Ключ заголовка для дедупа: заголовок целиком в нижнем регистре, из
+          которого вычищен только шум — маркеры пола, города и страны, ставки,
+          лишняя пунктуация. Специализация («- Finance», «(CRM)») остаётся,
+          поэтому такие вакансии не склеиваются. Правило —
+          macros/normalize_job_title.sql.
       - name: description_clean
         description: "Описание из API без HTML, из stg_vacancies. По нему считается is_english."
       - name: description_best
@@ -108,7 +111,7 @@ models:
       - name: excluded_reason
         description: >
           Первое сработавшее правило: wrong_seniority → not_english →
-          duplicate (компания + title_core) → irrelevant_role →
+          duplicate (company_core + title_key) → irrelevant_role →
           dead (страница вакансии отдала 404, см. stg_vacancy_pages) →
           non_data_role (заголовок продаж, работы с клиентами или найма) →
           foreign_language_required (модель нашла требование языка, кроме

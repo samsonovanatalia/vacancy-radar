@@ -90,51 +90,18 @@ vacancies as (
         -- в macros/normalize_company_name.sql.
         {{ normalize_company_name('company_name') }}    as company_core,
 
-        -- Ядро заголовка для дедупа — всё до первого разделителя:
-        -- «Data Engineer - Payments (m/w/d)» → «data engineer».
-        -- Шаги изнутри наружу:
-        --   1. убрать скобку в самом начале. Иначе «(Senior) CRM Manager»
-        --      обрезался бы по этой скобке до пустой строки (146 таких
-        --      заголовков), и все они у одной компании склеились бы в дубль;
-        --   2. отрезать всё от первого разделителя до конца строки.
-        --      Разделители: дефис с пробелом рядом, –, —, |, запятая, «(».
-        --      Дефис ВНУТРИ слова разделителем не считаем: иначе
-        --      «AI-Native Data Engineer» превратился бы в «ai»;
-        --   3. схлопнуть пробелы в один и обрезать края;
-        --   4. снять два хвоста, которые приклеены БЕЗ разделителя и потому
-        --      шаг 2 их не достаёт (добавлено 2026-09-20):
-        --        — город или страна в конце: «Senior Marketing Data Analyst
-        --          Barcelona» и «...Barcelona, Spain» (запятую уже срезал
-        --          шаг 2) — это одна вакансия Zynga в двух записях;
-        --        — маркер пола вне скобок: «Business Director H/F - CDI»
-        --          против «Business Director - (F/H) - CDI». В скобках его
-        --          снимает шаг 2, без скобок — нет.
-        --      Оба списка закрытые и короткие НАМЕРЕННО. Широкую склейку
-        --      «один заголовок — начало другого» мы не делаем: из 11 таких
-        --      пар в данных настоящих дублей меньше половины, а «Applied
-        --      Scientist» и «Applied Scientist II» — разные вакансии.
-        --      Ложная склейка прячет вакансию навсегда (она уйдёт как
-        --      duplicate), пропущенный дубль стоит одного лишнего сообщения.
+        -- Ключ заголовка для дедупа — заголовок ЦЕЛИКОМ, из которого
+        -- вычищен только шум: маркеры пола, города и страны, ставки,
+        -- лишняя пунктуация. Правило вынесено в макрос, подробности и
+        -- размен, на который мы идём, — в macros/normalize_job_title.sql.
+        --
+        -- До 2026-09-20 здесь была обрезка до первого разделителя. Она
+        -- резала вместе с шумом и смысл: у N26 «Data Analyst - Finance»,
+        -- «- Investments» и «- Ops Automation» схлопывались в одну строку,
+        -- и в подборку попадала одна вакансия из четырёх.
+        --
         -- title_normalized из staging уже в нижнем регистре.
-        trim(regexp_replace(
-            regexp_replace(
-                regexp_replace(
-                    regexp_replace(
-                        regexp_replace(title_normalized, r'^\s*\([^)]*\)', ''),
-                        r'(\s-|-\s|[–—|,(]).*$', ''
-                    ),
-                    -- маркер пола: h/f, f/h, m/f, f/m, m/w/d, w/m/d, m/f/d,
-                    -- f/m/d, d/m/w. Пробелы внутри допускаем — «m / w / d».
-                    r'\s+[mwfd](\s*/\s*[mwfd]){1,2}\s*$', ''
-                ),
-                -- город или страна в конце. Список — города, по которым мы
-                -- вообще ищем, плюс Испания и «spain». Не «любое последнее
-                -- слово»: так «Data Analyst Insurance» осталось бы «data
-                -- analyst» и склеилось с чужой вакансией.
-                r'\s+(barcelona|madrid|valencia|sevilla|bilbao|malaga|zaragoza|spain|espana|españa)\s*$', ''
-            ),
-            r'\s+', ' '
-        ))                                              as title_core
+        {{ normalize_job_title('title_normalized') }}   as title_key
 
     from {{ ref('stg_vacancies') }}
 
@@ -362,7 +329,8 @@ ranked as (
         -- coalesce на исходное название — иначе такие вакансии схлопнулись
         -- бы между собой.
         row_number() over (
-            partition by coalesce(company_core, lower(company_name)), title_core
+            partition by coalesce(company_core, lower(company_name)),
+                         coalesce(title_key, title_normalized)
             order by
                 coalesce(is_dead, false),
                 (seniority in ('lead', 'junior') or not is_english or is_non_data_title),
@@ -382,7 +350,7 @@ select
     ingested_at,
     title,
     title_normalized,
-    title_core,
+    title_key,
     company_name,
     -- Нормализованное название — вторая половина ключа дедупа. В подборку
     -- не идёт, но без него не разобрать, почему две вакансии слиплись.
