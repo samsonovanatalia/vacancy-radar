@@ -152,7 +152,17 @@ BATCH_SIZE = 10
 #        на v5 неанглийских объявлений было всего 5 (все пять ответов
 #        по-английски). Правило в промпте было и раньше, v6 делает его явным
 #        для объявлений на другом языке — теперь таких будут десятки.
-PROMPT_VERSION = "v6"
+#   v7 — две правки одной версией: каждое поднятие версии заново
+#        разыгрывает ВСЕ поля, поэтому чиним пачкой.
+#        1. Описание «по-английски» прямо в схеме у summary,
+#           responsibilities, requirements, benefits (ENGLISH_TEXT). v6 из
+#           61 неанглийского объявления оставил 10 ответов на языке
+#           оригинала: 8 немецких (чаще на «du»), 2 испанских.
+#        2. work_mode: если кандидат может выбрать полную удалёнку — remote.
+#           v6 назвал hybrid вакансию Cosuno с «Choose to work 100% remotely
+#           or from our modern office in Berlin» (v5 там отвечал remote), и
+#           её отсёк wrong_location.
+PROMPT_VERSION = "v7"
 
 PROMPT = """\
 You extract facts from a job posting. You receive a "Known fields" block
@@ -186,7 +196,10 @@ Rules:
   bi = dashboards and reporting; data_engineering = pipelines and data
   platforms; product_analytics = product usage and experiments;
   ml = machine learning; crm = CRM and marketing automation.
-- work_mode: onsite, hybrid or remote, as stated in the posting.
+- work_mode: onsite, hybrid or remote, as stated in the posting. If the
+  candidate may choose to work fully remotely ("choose to work 100% remotely
+  or from our office"), it is remote: an office that is only an option does
+  not make the job hybrid.
 - location_city, location_country: take them from the Location known field
   first; use the description only for what Location does not give.
   Country as an ISO 3166-1 alpha-2 code (ES, DE, GB); it may be derived from
@@ -240,10 +253,22 @@ KNOWN_FIELDS = {
 #
 # Словарь, а не класс pydantic: схема читается сверху вниз как таблица
 # полей, и никаких дополнительных понятий для этого не нужно.
+#
+# description у текстовых полей — с v7. То же правило есть и в промпте, но
+# промпт модель читает в начале, а описание поля — в момент, когда пишет его
+# значение, уже после длинного немецкого или испанского текста. Там его и
+# не хватало: в v6 правило было только в промпте, и 10 ответов из 61
+# неанглийского вышли на языке оригинала.
+ENGLISH_TEXT = "In English; translate if the posting is in another language."
+
 FIELDS = {
-    "summary": {"type": "STRING"},
-    "responsibilities": {"type": "ARRAY", "items": {"type": "STRING"}, "max_items": 5},
-    "requirements": {"type": "ARRAY", "items": {"type": "STRING"}, "max_items": 6},
+    "summary": {"type": "STRING", "description": ENGLISH_TEXT},
+    "responsibilities": {
+        "type": "ARRAY", "items": {"type": "STRING"}, "max_items": 5, "description": ENGLISH_TEXT,
+    },
+    "requirements": {
+        "type": "ARRAY", "items": {"type": "STRING"}, "max_items": 6, "description": ENGLISH_TEXT,
+    },
     "stack": {"type": "ARRAY", "items": {"type": "STRING"}},
     "seniority": {"type": "STRING", "enum": ["junior", "mid", "senior", "lead", "unclear"]},
     "domain": {
@@ -259,7 +284,9 @@ FIELDS = {
     "salary_currency": {"type": "STRING", "nullable": True},
     "salary_period": {"type": "STRING", "nullable": True},
     "application_deadline": {"type": "STRING", "nullable": True},
-    "benefits": {"type": "ARRAY", "items": {"type": "STRING"}, "max_items": 6},
+    "benefits": {
+        "type": "ARRAY", "items": {"type": "STRING"}, "max_items": 6, "description": ENGLISH_TEXT,
+    },
     "language": {"type": "STRING"},
     # Поля v5. Список объектов, а не строк вида «Spanish C1»: язык и уровень
     # лежат в разных полях, и будущему правилу исключения не придётся
