@@ -194,6 +194,33 @@ features as (
             else 'other'
         end                                             as location_fit,
 
+        -- Барселона по ДВУМ полям сразу: городу из обогащения и полю
+        -- location из источника.
+        --
+        -- Поля неравноценны, и работают они по-разному.
+        -- llm_location_city — это то же самое поле location, разобранное
+        -- моделью до названия города (промпт так и велит: «take them from
+        -- the Location known field first»), плюс город из текста описания,
+        -- если в location его не было. То есть это location, причёсанный и
+        -- дополненный. Поэтому «какой это город» спрашиваем у него.
+        -- Само location — свободный текст шести разных API: там и
+        -- «Barcelona, Cataluña», и «Spain», и «Worldwide», и пустая строка.
+        --
+        -- Отсюда асимметрия, ради которой поле и осталось в правиле: слову
+        -- «barcelona» внутри location верим — ошибиться в эту сторону почти
+        -- нечем. А его ОТСУТСТВИЮ не верим: «Spain» не значит, что вакансия
+        -- не в Барселоне. Поэтому location подтверждает Барселону, но
+        -- никогда её не опровергает; «город известен, и он не Барселона»
+        -- решает только llm_location_city.
+        --
+        -- regexp_contains, а не сравнение целиком: модель возвращает и
+        -- «Barcelona», и «Barcelona (hybrid)», источник — «Barcelona,
+        -- Cataluña, Spain». coalesce на '' — чтобы у пустого поля вышел
+        -- честный false, а не null.
+        regexp_contains(lower(coalesce(llm_location_city, '')), r'barcelona')
+            or regexp_contains(lower(coalesce(location, '')), r'barcelona')
+                                                        as is_barcelona,
+
         -- Только \b в начале, без \b в конце: так найдутся «Randstad España»
         -- и «ManpowerGroup», но не «Whays». Точное сравнение имени целиком
         -- пропустило бы почти всех — агентства пишутся с хвостами.
@@ -282,6 +309,51 @@ fits_location_rule as (
 
 ),
 
+wrong_location_rule as (
+
+    -- ПРАВИЛО «Барселона или полная удалёнка». Подходит либо работа в
+    -- Барселоне — офис, гибрид, неважно, — либо полная удалёнка откуда
+    -- угодно. Всё остальное, включая Мадрид с офисом или гибридом, мимо.
+    --
+    -- Зачем отдельное правило, а не fits_location выше. fits_location
+    -- отвечает на другой вопрос — «насколько локация мне подходит» — и
+    -- влияет только на балл (+3 / −5). В него подмешано требование к
+    -- резидентству, а гибрид в чужом городе даёт у него 'unclear', то есть
+    -- «не знаю». Здесь же нужен жёсткий да/нет по географии. Размен: два
+    -- признака про локацию рядом; взамен каждый читается и меняется
+    -- отдельно, не задевая второй.
+    --
+    -- Ветки сверху вниз, срабатывает первая:
+    --   1. Барселона                        → подходит, в любом формате
+    --   2. полная удалёнка                  → подходит, из любого города
+    --   3. город известен и это не Барселона → не подходит
+    --   4. города не знаем, но знаем формат, и он не remote → не подходит
+    --   5. не знаем ни города, ни формата   → НЕ исключаем
+    --
+    -- Ветка 5 — сознательное решение, а не недосмотр. Исключить вакансию,
+    -- которую мы просто не изучили, значит выбросить её за наше незнание,
+    -- а не за несоответствие. Такая вакансия идёт дальше и проигрывает
+    -- там, где и должна, — в баллах.
+    --
+    -- work_mode сравниваем со списком, а не с «is not null»: в промпте у
+    -- него есть отдельное значение 'unclear' — «в тексте не сказано».
+    -- Оно означает ровно «не знаю», и считать его известным форматом
+    -- нельзя, иначе ветка 4 выбросит всё необогащённое пополам с тем,
+    -- что модель честно не смогла прочитать.
+    select
+        *,
+        case
+            when is_barcelona                           then false
+            when llm_work_mode = 'remote'               then false
+            when llm_location_city is not null          then true
+            when llm_work_mode in ('onsite', 'hybrid')  then true
+            else false
+        end                                             as is_wrong_location
+
+    from fits_location_rule
+
+),
+
 ranked as (
 
     select
@@ -320,6 +392,19 @@ ranked as (
         -- а null при сортировке по возрастанию идёт ПЕРВЫМ, раньше false.
         -- Без coalesce непроверенная вакансия обходила бы проверенную живую.
         --
+        -- Третий ключ — копия, у которой в location ИЗ ИСТОЧНИКА есть
+        -- «barcelona» или «remote», с 2026-09-22. Та же беда, что с мёртвыми,
+        -- только её создало правило wrong_location: Air Apps выкладывает
+        -- «Product Analyst» в Амстердаме и в Барселоне, свежей была
+        -- амстердамская — она выигрывала дедуп и уходила как wrong_location,
+        -- барселонская уходила как duplicate. У Aircall так же проигрывала
+        -- копия «France Remote» лондонской.
+        -- Почему поле источника, а не is_barcelona / llm_work_mode: ответ
+        -- модели есть только у победителя (см. выше про правила по ответам
+        -- модели), у копий там null. Сортировка по нему снова выбирала бы
+        -- «ту, что уже обогащена», а не «ту, что подходит». location есть
+        -- у каждой копии с самого начала.
+        --
         -- vacancy_key в конце — чтобы при одинаковом posted_at результат
         -- не менялся от прогона к прогону.
         -- company_core вместо lower(company_name) с 2026-09-20: «Gartner»
@@ -334,11 +419,12 @@ ranked as (
             order by
                 coalesce(is_dead, false),
                 (seniority in ('lead', 'junior') or not is_english or is_non_data_title),
+                not regexp_contains(lower(coalesce(location, '')), r'barcelona|remote'),
                 posted_at desc,
                 vacancy_key
         )                                               as dedup_rank
 
-    from fits_location_rule
+    from wrong_location_rule
 
 )
 
@@ -376,6 +462,7 @@ select
     seniority,
     is_english,
     location_fit,
+    is_barcelona,
     is_agency,
     is_non_data_title,
 
@@ -387,6 +474,7 @@ select
     fits_location,
     is_foreign_language_required,
     is_residency_too_long,
+    is_wrong_location,
 
     -- Первое сработавшее правило. Если не сработало ни одно, case без else
     -- вернёт null — это и значит «вакансия проходит в подборку».
@@ -402,6 +490,15 @@ select
     -- промпта v5 (is_foreign_language_required, is_residency_too_long). В конец
     -- по той же причине: у вакансий, которые уже исключало другое правило,
     -- причина остаётся прежней.
+    --
+    -- wrong_location — «не Барселона и не полная удалёнка» (блок
+    -- wrong_location_rule). Стоит последним по той же договорённости, и
+    -- здесь у неё есть ещё одна польза: раз ни у одной вакансии причина не
+    -- поменялась, множество строк с wrong_location в точности равно тому,
+    -- что правило унесло из подборки. Один к одному, без примеси уже
+    -- отсеянных, — именно это и хотелось увидеть при вводе правила.
+    -- Поднять его выше — правка в одну строку, если когда-нибудь важнее
+    -- станет читать географию раньше остальных причин.
     case
         when seniority in ('lead', 'junior')    then 'wrong_seniority'
         when not is_english                     then 'not_english'
@@ -411,6 +508,7 @@ select
         when is_non_data_title                  then 'non_data_role'
         when is_foreign_language_required       then 'foreign_language_required'
         when is_residency_too_long              then 'residency_too_long'
+        when is_wrong_location                  then 'wrong_location'
     end                                                 as excluded_reason,
 
     -- Балл считаем для всех строк, в том числе исключённых: так при сверке

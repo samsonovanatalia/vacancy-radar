@@ -117,7 +117,21 @@ models:
           foreign_language_required (модель нашла требование языка, кроме
           английского, см. is_foreign_language_required) →
           residency_too_long (требуют больше года проживания в стране, см.
-          is_residency_too_long). null — вакансия проходит в подборку.
+          is_residency_too_long) → wrong_location (не Барселона и не полная
+          удалёнка, см. is_wrong_location). null — вакансия проходит
+          в подборку.
+      - name: is_barcelona
+        description: >
+          Барселона по двум полям сразу: llm_location_city из обогащения и
+          location из источника. location только подтверждает Барселону и
+          никогда не опровергает — это свободный текст шести API, где
+          «Spain» и «Worldwide» не значат «не Барселона».
+      - name: is_wrong_location
+        description: >
+          Вакансия не в Барселоне и не полная удалёнка. true, только когда
+          есть положительное свидетельство: известен город (и он не
+          Барселона) или известен формат работы (onsite/hybrid). Если не
+          знаем ни города, ни формата — false: не исключаем за незнание.
       - name: relevance_score
         description: >
           Эвристика релевантности: за роль +4 analytics_engineer, +3 analyst,
