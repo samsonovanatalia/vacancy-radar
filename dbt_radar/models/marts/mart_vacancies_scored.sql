@@ -426,6 +426,70 @@ ranked as (
 
     from wrong_location_rule
 
+),
+
+enrichment_rule as (
+
+    -- КТО ИДЁТ К МОДЕЛИ. Правила исключения бывают двух видов:
+    --   - проверяемые без модели: грейд, роль, заголовок не про данные,
+    --     мёртвая страница, дубль. Ответ на них есть у каждой вакансии
+    --     сразу после сбора;
+    --   - зависящие от ответа модели или от языка: not_english,
+    --     foreign_language_required, residency_too_long, wrong_location.
+    -- Кандидат на обогащение — вакансия, прошедшая правила ПЕРВОГО вида.
+    -- Правила второго вида кандидатов не отсекают: иначе модель никогда не
+    -- увидит вакансию, про которую как раз она и должна ответить. Так было
+    -- до 2026-09-22 — к модели шла только готовая подборка, и испанские
+    -- вакансии в Барселоне отсекал not_english раньше, чем модель успевала
+    -- их прочитать.
+    --
+    -- Флаг живёт здесь, а не в скриптах: условие раньше собирали у себя и
+    -- enrich/with_gemini.py, и fetch/adzuna_pages.py, каждый своё. Теперь
+    -- оба читают mart_enrichment_candidates, а та — только этот флаг.
+    --
+    -- Флагов два, и второй не заменяет первый:
+    --   is_enrichment_candidate — прошла правила первого вида. По нему
+    --     fetch/adzuna_pages.py качает страницы;
+    --   is_ready_for_enrichment — кандидат, у которого есть полный текст.
+    --     По нему enrich/with_gemini.py отправляет вакансию модели.
+    -- Условие про полный текст нельзя класть в первый флаг: у свежей
+    -- вакансии Adzuna страницы ещё нет, значит она не стала бы кандидатом,
+    -- и скрипт страниц её бы не скачал — круг замкнулся бы, и новые
+    -- вакансии Adzuna не обогащались бы никогда.
+    --
+    -- Почему модели нужен полный текст: API Adzuna обрезает описание на
+    -- 500 символах, а ответ модели на обрывок записывается с версией
+    -- промпта и повторно не запрашивается. Такая вакансия подождёт день и
+    -- пойдёт к модели со страницей. У остальных источников описание в API
+    -- полное, страниц у них нет — им условие не нужно.
+    --
+    -- coalesce на is_dead: у вакансии без скачанной страницы он null, а
+    -- not null — тоже null, и строка выпала бы из кандидатов. То есть
+    -- страницу не скачали бы именно потому, что её ещё не скачали.
+    select
+        *,
+        seniority not in ('lead', 'junior')
+            and role_type != 'other'
+            and not is_non_data_title
+            and not coalesce(is_dead, false)
+            and dedup_rank = 1                          as is_enrichment_candidate
+
+    from ranked
+
+),
+
+enrichment_ready as (
+
+    -- Отдельный блок, потому что в одном select нельзя сослаться на
+    -- колонку, которая в нём же и вычисляется.
+    select
+        *,
+        is_enrichment_candidate
+            and (source != 'adzuna' or description_source = 'page')
+                                                        as is_ready_for_enrichment
+
+    from enrichment_rule
+
 )
 
 select
@@ -475,6 +539,13 @@ select
     is_foreign_language_required,
     is_residency_too_long,
     is_wrong_location,
+
+    -- Номер копии в группе дублей и признак мёртвой страницы. Нужны снаружи,
+    -- чтобы по витрине было видно, из чего сложился is_enrichment_candidate.
+    dedup_rank,
+    is_dead,
+    is_enrichment_candidate,
+    is_ready_for_enrichment,
 
     -- Первое сработавшее правило. Если не сработало ни одно, case без else
     -- вернёт null — это и значит «вакансия проходит в подборку».
@@ -540,4 +611,4 @@ select
         + case when salary_min is not null then 1 else 0 end
     )                                                   as relevance_score
 
-from ranked
+from enrichment_ready

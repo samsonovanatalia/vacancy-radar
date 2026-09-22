@@ -138,6 +138,50 @@ models:
           +2 product_analyst, +1 data_engineer; +2 spain / +1 remote
           по location_fit, +3 / −5 за fits_location yes / no, −2 за senior,
           +1 за указанную зарплату.
+      - name: dedup_rank
+        description: >
+          Номер копии в группе дублей (компания + ядро заголовка). 1 —
+          победитель, остальные исключаются как duplicate.
+      - name: is_dead
+        description: >
+          Страница вакансии отдала 404 (stg_vacancy_pages). null — страницу
+          не скачивали: у источников, кроме Adzuna, её не бывает вовсе.
+      - name: is_enrichment_candidate
+        description: >
+          Прошла правила исключения, проверяемые без модели: грейд, роль,
+          заголовок не про данные, мёртвая страница, дубль. Правила, которые
+          зависят от модели или языка (not_english, foreign_language_required,
+          residency_too_long, wrong_location), кандидатов не отсекают.
+          По этому флагу fetch/adzuna_pages.py качает страницы.
+        tests:
+          # null здесь — вакансия тихо выпала бы и из обогащения, и из
+          # догрузки страниц. Лучше пусть упадёт сборка.
+          - not_null
+      - name: is_ready_for_enrichment
+        description: >
+          Кандидат, у которого есть полный текст: у Adzuna — только при
+          description_source = 'page', у остальных источников — всегда.
+          По этому флагу enrich/with_gemini.py отправляет вакансию модели.
+        tests:
+          - not_null
+
+  - name: mart_enrichment_candidates
+    description: >
+      Кандидаты на обогащение и на догрузку страниц: вакансии из
+      mart_vacancies_scored с is_enrichment_candidate. Одна строка = одна
+      вакансия. Своих правил не содержит — только выбирает строки и колонки,
+      которые читают fetch/adzuna_pages.py (все строки Adzuna) и
+      enrich/with_gemini.py (строки с is_ready_for_enrichment).
+    columns:
+      - name: vacancy_key
+        description: "Ключ вакансии: source + ':' + source_id. Грейн витрины."
+        tests:
+          - not_null
+          - unique
+      - name: is_ready_for_enrichment
+        description: "Есть полный текст — можно отправлять модели."
+        tests:
+          - not_null
 
   - name: mart_digest_queue
     description: >

@@ -6,7 +6,7 @@
 сайт держит для Google Jobs.
 
 Что делает скрипт:
-  1. Берёт вакансии Adzuna из mart_vacancies_for_me, по которым в
+  1. Берёт вакансии Adzuna из mart_enrichment_candidates, по которым в
      raw.vacancy_pages нет свежего окончательного ответа. Не больше MAX_PER_RUN.
   2. Для каждой скачивает страницу по сохранённой ссылке из API — целиком,
      с параметрами, — с честным User-Agent и паузой между запросами.
@@ -84,8 +84,11 @@ RETRY_PAUSES = [5, 15, 45]
 DISALLOWED_PATH_PREFIXES = ("/land/ad/", "/jobs/land/ad/")
 SKIP_REASON = "не запрашивали: путь /land/ad/ запрещён в robots.txt"
 
-# Потолок на прогон. 60 — с запасом на всю подборку Adzuna (в ней несколько
-# десятков вакансий): при паузе PAUSE_SECONDS это около четырёх минут.
+# Потолок на прогон: при паузе PAUSE_SECONDS 60 страниц — около четырёх минут.
+# С 2026-09-22 страницы качаются для всех кандидатов на обогащение, а не для
+# одной подборки: кандидатов Adzuna за 30 дней — около 130, новых — единицы
+# в день. Разовый хвост (61 вакансия без страницы) 60 в день догоняют за
+# один-два прогона, дальше потолка хватает с запасом.
 # Аргументом командной строки потолок можно опустить, но не поднять — как в
 # enrich/with_gemini.py.
 MAX_PER_RUN = 60
@@ -162,7 +165,14 @@ def ensure_table(bq: bigquery.Client, table_id: str) -> None:
 
 
 def fetch_candidates(bq: bigquery.Client, project: str, limit: int) -> list[dict]:
-    """Вакансии Adzuna из подборки, по которым ещё нет окончательного ответа."""
+    """Вакансии Adzuna из кандидатов на обогащение, по которым ещё нет окончательного ответа."""
+    # Кого вообще качаем, решает dbt: все строки Adzuna в
+    # mart_enrichment_candidates (правило — is_enrichment_candidate в
+    # mart_vacancies_scored). Не подборка, как раньше: модель теперь читает
+    # и вакансии, которые подборка отсекает за язык или локацию, и полный
+    # текст нужен ей до этого решения, а не после. is_ready_for_enrichment
+    # здесь не смотрим: он как раз и ждёт страницу, которую качает этот скрипт.
+    #
     # Первое not exists: свежий окончательный ответ — код 200 с текстом или
     # код 404, полученный за последние RECHECK_AFTER_DAYS дней. Ответ старше
     # вакансию не исключает: живость устарела, и её пора проверить снова.
@@ -178,10 +188,6 @@ def fetch_candidates(bq: bigquery.Client, project: str, limit: int) -> list[dict
     #
     # not exists, а не not in (select ...): окажись в подзапросе хоть один
     # null, not in не вернул бы ничего.
-    #
-    # source_id берём из mart_vacancies_scored: в mart_vacancies_for_me этой
-    # колонки нет, а выковыривать её из vacancy_key — значит полагаться на
-    # формат ключа.
     #
     # Порядок: сначала вакансии с меньшим числом прошлых попыток — ни разу не
     # пробованные первыми, — потом по релевантности. Иначе вакансии, которые
@@ -206,11 +212,9 @@ def fetch_candidates(bq: bigquery.Client, project: str, limit: int) -> list[dict
 
         select
             f.vacancy_key,
-            s.source_id,
+            f.source_id,
             f.url
-        from `{project}.{MARTS_DATASET}.mart_vacancies_for_me` as f
-        join `{project}.{MARTS_DATASET}.mart_vacancies_scored` as s
-          on s.vacancy_key = f.vacancy_key
+        from `{project}.{MARTS_DATASET}.mart_enrichment_candidates` as f
         left join attempts as a
           on a.vacancy_key = f.vacancy_key
         where f.source = 'adzuna'
