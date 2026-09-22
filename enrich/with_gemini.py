@@ -115,7 +115,7 @@ MAX_CONSECUTIVE_FAILURES = 5
 # source в dbt_radar/models/staging/_staging.yml: появится источник — дописать
 # в оба места. Без проверки опечатка (--source adzna) дала бы ноль кандидатов,
 # и скрипт молча завершился бы успешно, ничего не сделав.
-SOURCES = ["arbeitnow", "adzuna", "remoteok", "remotive", "telegram"]
+SOURCES = ["arbeitnow", "adzuna", "remoteok", "remotive", "telegram", "manfred"]
 
 # Сколько ответов копить перед записью в BigQuery. Пишем порциями, а не
 # одним куском в конце: если процесс убьют извне (отмена задачи в GitHub

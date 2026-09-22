@@ -45,6 +45,13 @@ with vacancies as (
         relevance_score,
         description_source,
 
+        -- Город и формат работы — итоговые из витрины (блок facts): поле
+        -- источника, а где его нет — ответ модели. Из stg_enrichment их не
+        -- берём: у вакансии Manfred без обогащения там пусто, хотя
+        -- источник формат и город знает.
+        work_mode,
+        location_city,
+
         -- На чём основано решение о живости. Решает источник, а не то, есть
         -- ли у вакансии строка в stg_vacancy_pages: у вакансии Adzuna, до
         -- которой проверка ещё не дошла, строки нет, но судить о ней по дате
@@ -78,9 +85,7 @@ enrichment as (
     -- mart_vacancies_scored; зарплата — найденная моделью в тексте.
     select
         vacancy_key,
-        location_city,
         location_country,
-        work_mode,
         seniority,
         stack,
         salary_min,
@@ -127,9 +132,9 @@ select
     vacancies.posted_at,
     vacancies.title,
     vacancies.company_name,
-    enrichment.location_city,
+    vacancies.location_city,
     enrichment.location_country,
-    enrichment.work_mode,
+    vacancies.work_mode,
     enrichment.seniority,
     enrichment.stack,
     enrichment.salary_min,

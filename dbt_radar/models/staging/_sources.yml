@@ -42,6 +42,15 @@ sources:
           Мадрид, Амстердам) за последние 3 дня. Служебные поля query,
           salary_is_predicted и category_label живут только здесь, в raw.
 
+      - name: manfred
+        description: >
+          Испанская площадка для найма в IT, публичный API без ключа. Главное
+          записано структурно: languages (требуемые языки с уровнем),
+          remote_percentage (0–100), location (города через «, »), зарплата
+          числами. Служебные поля remote_percentage, languages,
+          offer_languages, salary_currency и slug живут здесь, в raw;
+          структурные из них достаёт stg_manfred_facts.
+
       - name: llm_enrichment
         description: >
           Ответы Gemini по вакансиям из подборки: суть, стек, режим работы,

@@ -89,6 +89,32 @@ models:
           В заголовке слова продаж, работы с клиентами или найма: account executive,
           sales, business development, account manager, customer success, recruiter.
           Такая вакансия исключается как non_data_role.
+      - name: work_mode
+        description: >
+          Итоговый формат работы: из структурного поля источника (у Manfred —
+          remote_percentage: 100 → remote, 0 → onsite, между → hybrid), а где
+          его нет — llm_work_mode. Его читают правила fits_location и
+          wrong_location.
+      - name: location_city
+        description: >
+          Итоговый город: первый из списка городов источника (Manfred), а где
+          списка нет — llm_location_city.
+      - name: required_languages
+        description: >
+          Итоговые требуемые языки: из поля languages источника (Manfred), если
+          оно не пустое, иначе llm_required_languages. Пустой languages —
+          «компания не указала», и тогда решает модель.
+      - name: has_language_check
+        description: >
+          Язык проверен: источник назвал требуемые языки или есть ответ модели
+          v5+. false у вакансии не на английском и не на русском — она
+          придерживается как awaiting_language_check.
+      - name: has_source_facts
+        description: "true, если у вакансии есть структурные поля источника (stg_manfred_facts); иначе null."
+      - name: src_remote_percentage
+        description: "Доля удалённой работы из источника, 0–100 (только Manfred)."
+      - name: src_required_languages
+        description: "Требуемые языки из источника как есть (только Manfred); пусто — не указаны."
       - name: llm_work_mode
         description: "Режим работы по ответу модели: onsite / hybrid / remote / unclear. null — не обогащена."
       - name: llm_location_city

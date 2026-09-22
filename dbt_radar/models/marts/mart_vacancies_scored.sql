@@ -48,6 +48,21 @@ with enrichment as (
 
 ),
 
+manfred_facts as (
+
+    -- Структурные поля Manfred: требуемые языки, процент удалёнки, города.
+    -- Префикс src_ — по той же причине, что llm_ у модели: сразу видно,
+    -- откуда поле. Сводятся с ответом модели в блоке facts.
+    select
+        vacancy_key,
+        required_languages                          as src_required_languages,
+        remote_percentage                           as src_remote_percentage,
+        location_cities                             as src_location_cities,
+        true                                        as has_source_facts
+    from {{ ref('stg_manfred_facts') }}
+
+),
+
 pages as (
 
     -- Признак снятой вакансии со страницы. Страницы скачиваются пока только
@@ -125,10 +140,75 @@ vacancies as (
     -- То же для страниц: страницы нет — вакансия остаётся, is_dead null.
     left join pages using (vacancy_key)
 
+    -- И для структурных полей: они есть только у Manfred.
+    left join manfred_facts using (vacancy_key)
+
     -- Окно в 30 дней: столько вакансия может ждать в очереди на отправку
     -- (mart_digest_queue). Строки без posted_at сравнение отсекает (null >= x
     -- даёт null, а не true) — вакансию без даты считать свежей нельзя.
     where posted_at >= timestamp_sub(current_timestamp(), interval 30 day)
+
+),
+
+facts as (
+
+    -- ФАКТЫ О ВАКАНСИИ: ПОЛЕ ИСТОЧНИКА ГЛАВНЕЕ МОДЕЛИ. Единственное место
+    -- в витрине, где поле источника сводится с ответом модели; все правила
+    -- ниже читают только эти колонки.
+    --
+    -- Почему источник главнее: структурное поле компания заполнила сама,
+    -- выбрав из списка, — ошибиться в нём почти нечем. Ответ модели — это
+    -- чтение свободного текста, и он ошибается: 22.09.2026 v6 назвала
+    -- hybrid вакансию с «Choose to work 100% remotely». Поэтому модель —
+    -- только там, где поля нет. Пока такие поля есть только у Manfred
+    -- (stg_manfred_facts); у остальных источников src_* пустые, и всё
+    -- решает модель, как раньше.
+    --
+    -- Все четыре колонки — без префикса: это уже не «ответ модели» и не
+    -- «поле источника», а итог. Откуда он взят, видно по has_source_facts
+    -- и по llm_* рядом в итоговой таблице.
+    select
+        *,
+
+        -- Формат работы из remote_percentage: 100 — полностью удалённая,
+        -- 0 — офис, между — гибрид. Процента нет — модель.
+        coalesce(
+            case
+                when src_remote_percentage = 100 then 'remote'
+                when src_remote_percentage = 0   then 'onsite'
+                when src_remote_percentage > 0   then 'hybrid'
+            end,
+            llm_work_mode
+        )                                               as work_mode,
+
+        -- Город — первый из списка источника. Список пуст (полная
+        -- удалёнка) — safe_offset даёт null, и слово за моделью.
+        -- Барселону, стоящую в списке не первой («Madrid, España,
+        -- Barcelona, España»), не теряем: is_barcelona ищет её во всём
+        -- поле location.
+        coalesce(
+            src_location_cities[safe_offset(0)],
+            llm_location_city
+        )                                               as location_city,
+
+        -- Требуемые языки. Не coalesce, а проверка на пустоту: пустой
+        -- languages у Manfred значит «компания не указала», а не «язык не
+        -- нужен», — массив при этом не null, а пустой, и coalesce его
+        -- принял бы. Такие вакансии решает модель, как у всех источников.
+        case
+            when array_length(src_required_languages) > 0
+                then src_required_languages
+            else llm_required_languages
+        end                                             as required_languages,
+
+        -- Проверен ли язык: источник назвал языки или есть ответ модели
+        -- v5+. Если нет ни того, ни другого, вакансию на другом языке
+        -- придерживает language_rule — в том числе вакансию Manfred с
+        -- пустым languages, пока модель недоступна. Это не обходим.
+        coalesce(array_length(src_required_languages) > 0, false)
+            or coalesce(llm_has_language_check, false)  as has_language_check
+
+    from vacancies
 
 ),
 
@@ -222,11 +302,12 @@ features as (
             else 'other'
         end                                             as location_fit,
 
-        -- Барселона по ДВУМ полям сразу: городу из обогащения и полю
-        -- location из источника.
+        -- Барселона по ДВУМ полям сразу: итоговому городу location_city
+        -- (блок facts: город из структурного поля источника, а где его нет —
+        -- из обогащения) и полю location из источника.
         --
         -- Поля неравноценны, и работают они по-разному.
-        -- llm_location_city — это то же самое поле location, разобранное
+        -- Город из обогащения — это то же самое поле location, разобранное
         -- моделью до названия города (промпт так и велит: «take them from
         -- the Location known field first»), плюс город из текста описания,
         -- если в location его не было. То есть это location, причёсанный и
@@ -239,13 +320,13 @@ features as (
         -- нечем. А его ОТСУТСТВИЮ не верим: «Spain» не значит, что вакансия
         -- не в Барселоне. Поэтому location подтверждает Барселону, но
         -- никогда её не опровергает; «город известен, и он не Барселона»
-        -- решает только llm_location_city.
+        -- решает только location_city.
         --
         -- regexp_contains, а не сравнение целиком: модель возвращает и
         -- «Barcelona», и «Barcelona (hybrid)», источник — «Barcelona,
         -- Cataluña, Spain». coalesce на '' — чтобы у пустого поля вышел
         -- честный false, а не null.
-        regexp_contains(lower(coalesce(llm_location_city, '')), r'barcelona')
+        regexp_contains(lower(coalesce(location_city, '')), r'barcelona')
             or regexp_contains(lower(coalesce(location, '')), r'barcelona')
                                                         as is_barcelona,
 
@@ -281,11 +362,13 @@ features as (
         -- не на английском (см. language_rule), — раньше их отсекал
         -- not_english по языку текста.
         -- lower: модель просили код ISO 639-1, но «EN» и «en» не должны
-        -- разойтись. Обогащения нет — llm_required_languages null, unnest
+        -- разойтись. У языков из источника код тоже приведён к нижнему
+        -- регистру (stg_manfred_facts). Языков нет ни у источника, ни у
+        -- модели — required_languages null, unnest
         -- даёт ноль строк, и exists честно возвращает false, а не null.
         exists (
             select 1
-            from unnest(llm_required_languages) as l
+            from unnest(required_languages) as l
             where lower(l.language) not in ('en', 'ru')
         )                                               as is_foreign_language_required,
 
@@ -295,7 +378,7 @@ features as (
         -- раньше false и сдвинул бы, какая копия вакансии остаётся.
         coalesce(llm_residency_years_required > 1, false) as is_residency_too_long
 
-    from vacancies
+    from facts
 
 ),
 
@@ -322,7 +405,7 @@ language_rule as (
         *,
         not is_english
             and not is_russian
-            and not coalesce(llm_has_language_check, false)
+            and not has_language_check
                                                         as is_awaiting_language_check
 
     from features
@@ -351,9 +434,9 @@ fits_location_rule as (
     select
         *,
         case
-            when llm_enriched_at is null
+            when llm_enriched_at is null and not coalesce(has_source_facts, false)
                 then null
-            when regexp_contains(lower(coalesce(llm_location_city, '')), r'barcelona')
+            when regexp_contains(lower(coalesce(location_city, '')), r'barcelona')
                 then 'yes'
             when llm_residency_requirement is not null
                  and not regexp_contains(
@@ -361,9 +444,9 @@ fits_location_rule as (
                      r'spain|españa|espana|spanish|barcelona|madrid|\beu\b|european union|europe|emea'
                  )
                 then 'no'
-            when llm_work_mode = 'remote'
+            when work_mode = 'remote'
                 then 'yes'
-            when llm_work_mode = 'onsite' and llm_location_city is not null
+            when work_mode = 'onsite' and location_city is not null
                 then 'no'
             else 'unclear'
         end                                             as fits_location
@@ -407,9 +490,9 @@ wrong_location_rule as (
         *,
         case
             when is_barcelona                           then false
-            when llm_work_mode = 'remote'               then false
-            when llm_location_city is not null          then true
-            when llm_work_mode in ('onsite', 'hybrid')  then true
+            when work_mode = 'remote'                   then false
+            when location_city is not null              then true
+            when work_mode in ('onsite', 'hybrid')      then true
             else false
         end                                             as is_wrong_location
 
@@ -599,6 +682,15 @@ select
     is_barcelona,
     is_agency,
     is_non_data_title,
+
+    -- Итоговые факты (блок facts): поле источника, а где его нет — модель.
+    work_mode,
+    location_city,
+    required_languages,
+    has_language_check,
+    has_source_facts,
+    src_remote_percentage,
+    src_required_languages,
 
     llm_work_mode,
     llm_location_city,

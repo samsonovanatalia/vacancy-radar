@@ -27,7 +27,7 @@ models:
               # Список разрешённых значений. Если завтра появится источник,
               # о котором мы не знаем, тест упадёт — и это правильно.
               arguments:
-                values: ['arbeitnow', 'adzuna', 'remoteok', 'remotive', 'telegram']
+                values: ['arbeitnow', 'adzuna', 'remoteok', 'remotive', 'telegram', 'manfred']
 
       - name: title
         tests:
@@ -58,6 +58,29 @@ models:
           - accepted_values:
               arguments:
                 values: ['page', 'api']
+
+  - name: stg_manfred_facts
+    description: >
+      Структурные поля Manfred, которых нет у других источников. Одна строка =
+      одна вакансия Manfred (самая свежая загрузка). Витрина берёт их вместо
+      ответа модели там, где они заполнены.
+    columns:
+      - name: vacancy_key
+        description: "Ключ вакансии: 'manfred:' + id оффера."
+        tests:
+          - unique
+          - not_null
+      - name: required_languages
+        description: >
+          Требуемые языки из поля languages: записи {language, level}, код в
+          нижнем регистре — та же форма, что у ответа модели. Пустой массив —
+          компания языки не указала, а не «язык не нужен».
+      - name: remote_percentage
+        description: "Доля удалённой работы, 0–100, как в источнике."
+      - name: location_cities
+        description: >
+          Города из location по отдельности. Пустой массив — места работы нет,
+          у Manfred так пишут полностью удалённые вакансии.
 
   - name: stg_vacancy_pages
     description: >

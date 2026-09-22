@@ -6,7 +6,7 @@
 --   {{ source('raw', 'arbeitnow') }} — ссылка на источник вместо имени таблицы.
 --   Благодаря ей dbt строит граф зависимостей автоматически.
 --
--- Источников теперь четыре, и у них слегка разный набор полей. Поэтому каждый
+-- Источников теперь пять, и у них слегка разный набор полей. Поэтому каждый
 -- приводится к общему списку колонок в своём блоке, а потом они склеиваются
 -- через union all. union all сопоставляет колонки ПО ПОРЯДКУ, а не по имени,
 -- так что порядок и типы во ВСЕХ блоках должны совпадать до последней колонки.
@@ -176,6 +176,56 @@ adzuna as (
 
 ),
 
+manfred as (
+
+    -- Структурные поля, которых нет у других источников (требуемые языки,
+    -- процент удалёнки, список городов), сюда не идут: union all требует
+    -- одинаковых колонок во всех ветках, и ради одного источника пришлось
+    -- бы добавить четыре пустые колонки в каждую. Их достаёт отдельная
+    -- модель stg_manfred_facts, а витрина присоединяет её по vacancy_key.
+    select
+        source,
+
+        -- Как у adzuna: в raw колонка INTEGER — id у Manfred числовой.
+        cast(source_id as string)                   as source_id,
+
+        title,
+        company_name,
+
+        -- Города через «, »: «Madrid, España, Barcelona, España». Пусто —
+        -- у полностью удалённых вакансий. Список городов по отдельности —
+        -- в stg_manfred_facts.
+        location,
+
+        -- true только при remote_percentage = 100 (так решил коллектор).
+        -- Точный процент — в stg_manfred_facts.
+        remote,
+
+        url,
+        tags,
+        job_types,
+        description,
+
+        -- Даты публикации у Manfred нет, коллектор кладёт сюда updatedAt.
+        created_at_unix,
+
+        ingested_at,
+        source_page,
+
+        -- salaryFrom и salaryTo — числа, годовые. Валюта в raw знаком
+        -- («€»), в общий список колонок не входит. cast — как у adzuna:
+        -- держит тип стабильным, если автодетект однажды решит иначе.
+        cast(salary_min as int64)                   as salary_min,
+        cast(salary_max as int64)                   as salary_max,
+
+        -- Текстом зарплату Manfred не отдаёт. Типизированный null, как у
+        -- остальных: в raw колонка пустая, и тип у неё угадан наугад.
+        cast(null as string)                        as salary_text
+
+    from {{ source('raw', 'manfred') }}
+
+),
+
 source_data as (
 
     -- union all, а не union distinct: дубли снимает блок deduplicated ниже,
@@ -194,6 +244,10 @@ source_data as (
     union all
 
     select * from adzuna
+
+    union all
+
+    select * from manfred
 
 ),
 

@@ -62,12 +62,23 @@ jobs:
         run: pip install -r requirements.txt
 
       # --- 1. Сбор из источников ---
+      #
+      # if: !cancelled() у каждого шага отсюда и до конца — то же правило,
+      # что у третьей сборки dbt (см. комментарий у неё): упавший шаг не
+      # останавливает остальные, но задача остаётся красной, и сбой виден.
+      # Без условия GitHub пропускает ВСЕ шаги после упавшего: сломайся
+      # один источник — не собрались бы и не загрузились остальные, не
+      # пересобрались бы витрины, и утром не было бы дайджеста.
+      # Условие стоит у всех источников, а не только у manfred: иначе
+      # его сбой всё равно остановил бы шаги после него.
 
       - name: Собрать вакансии (arbeitnow)
+        if: ${{ !cancelled() }}
         timeout-minutes: 10
         run: python -m collectors.arbeitnow
 
       - name: Собрать вакансии (remoteok)
+        if: ${{ !cancelled() }}
         timeout-minutes: 10
         run: python -m collectors.remoteok
 
@@ -75,11 +86,19 @@ jobs:
       # только на время шага: в логах вместо значения будет ***.
       # Обычно полторы минуты: 12 поисковых запросов и повторы при сбоях.
       - name: Собрать вакансии (adzuna)
+        if: ${{ !cancelled() }}
         timeout-minutes: 15
         env:
           ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
           ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
         run: python -m collectors.adzuna
+
+      # Manfred — публичный API без ключа. Около двух минут: список офферов
+      # одним запросом, потом ~60 карточек дата-ролей с паузой в секунду.
+      - name: Собрать вакансии (manfred)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: python -m collectors.manfred
 
       # remotive отключён: публичный API отдаёт всего 17 вакансий на весь рынок
       # и игнорирует параметр category, ни одной data-вакансии в выдаче нет.
@@ -98,24 +117,33 @@ jobs:
       # printf '%s' безопаснее echo: не ломается на кавычках внутри ключа
       # и не разворачивает escape-последовательности.
       - name: Положить ключ сервисного аккаунта
+        if: ${{ !cancelled() }}
         timeout-minutes: 2
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: printf '%s' "$GCP_SA_KEY" > key.json
 
       - name: Загрузить arbeitnow в BigQuery
+        if: ${{ !cancelled() }}
         timeout-minutes: 5
         run: python -m load.to_bigquery arbeitnow
 
       - name: Загрузить remoteok в BigQuery
+        if: ${{ !cancelled() }}
         timeout-minutes: 5
         run: python -m load.to_bigquery remoteok
 
       # Ключи Adzuna здесь уже не нужны: загрузчик читает готовый файл
       # data/raw_adzuna.jsonl и в источник не ходит.
       - name: Загрузить adzuna в BigQuery
+        if: ${{ !cancelled() }}
         timeout-minutes: 5
         run: python -m load.to_bigquery adzuna
+
+      - name: Загрузить manfred в BigQuery
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: python -m load.to_bigquery manfred
 
       # - name: Загрузить remotive в BigQuery
       #   timeout-minutes: 5
@@ -160,6 +188,7 @@ jobs:
       # Обычно сборка идёт полминуты; 15 минут — запас на медленный BigQuery.
 
       - name: dbt build 1 из 3 — подборка из сегодняшних вакансий
+        if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: |
           dbt build \
@@ -180,11 +209,13 @@ jobs:
       # кодом 1 — шаг будет отмечен в логе как упавший, но следующие шаги
       # отработают по описаниям из API.
       - name: Скачать полный текст вакансий Adzuna
+        if: ${{ !cancelled() }}
         timeout-minutes: 20
         continue-on-error: true
         run: python -m fetch.adzuna_pages
 
       - name: dbt build 2 из 3 — текст скачанных страниц в витринах
+        if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: |
           dbt build \
@@ -201,6 +232,7 @@ jobs:
       # Обычный прогон короче: ~7 секунд на вакансию, 2.4 минуты 15.09.2026;
       # при потолке 100 кандидатов — около 13 минут.
       - name: Обогатить вакансии через Gemini
+        if: ${{ !cancelled() }}
         timeout-minutes: 30
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
