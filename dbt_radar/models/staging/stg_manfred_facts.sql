@@ -47,6 +47,22 @@ with manfred as (
             order by position
         )                                               as location_cities,
 
+        -- Валюта зарплаты. В raw она знаком («€», «US$», «£»), а у нас
+        -- везде код ISO 4217 — так же, как в ответе модели, с которым её
+        -- сводит витрина. Незнакомый знак оставляем null: выдумывать код
+        -- нельзя, а зарплату числами это не отменяет.
+        case salary_currency
+            when '€'   then 'EUR'
+            when 'US$' then 'USD'
+            when '£'   then 'GBP'
+        end                                             as salary_currency,
+
+        -- Период у Manfred всегда год: salaryFrom и salaryTo — годовые
+        -- суммы (25 000–80 000 в собранных данных). Отдельного поля с
+        -- периодом в API нет, поэтому пишем его здесь, а не угадываем
+        -- по величине суммы в витрине.
+        'year'                                          as salary_period,
+
         ingested_at,
 
         -- Когда вакансию последний раз видели в списке офферов. raw только
@@ -74,6 +90,8 @@ select
     required_languages,
     remote_percentage,
     location_cities,
+    salary_currency,
+    salary_period,
     last_seen_at
 
 from manfred

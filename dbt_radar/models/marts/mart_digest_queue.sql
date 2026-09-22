@@ -56,6 +56,14 @@ with vacancies as (
         -- У остальных источников null: это признак живости только там.
         src_last_seen_at,
 
+        -- Зарплата — итоговая из витрины (блок facts): вилка из полей
+        -- источника, а если их нет, то найденная моделью в тексте.
+        -- Имена колонок в очереди прежние, поэтому бот не меняется.
+        salary_min_best                             as salary_min,
+        salary_max_best                             as salary_max,
+        salary_currency_best                        as salary_currency,
+        salary_period_best                          as salary_period,
+
         -- На чём основано решение о живости. Решает источник, а не то, есть
         -- ли у вакансии строка в stg_vacancy_pages: у вакансии Adzuna, до
         -- которой проверка ещё не дошла, строки нет, но судить о ней по дате
@@ -92,16 +100,16 @@ enrichment as (
 
     -- Поля модели берём из stg_enrichment как есть: seniority здесь — оценка
     -- модели (по заголовку и требуемому опыту), а не наша по заголовку из
-    -- mart_vacancies_scored; зарплата — найденная моделью в тексте.
+    -- mart_vacancies_scored.
+    --
+    -- Зарплаты здесь больше нет: с 2026-09-22 её берём из витрины, где
+    -- вилка источника главнее найденной моделью (блок facts). Город и
+    -- формат работы ушли туда же и по той же причине.
     select
         vacancy_key,
         location_country,
         seniority,
         stack,
-        salary_min,
-        salary_max,
-        salary_currency,
-        salary_period,
         residency_requirement,
         summary,
         -- Язык объявления (ISO 639-1) по ответу модели. Бот пишет
@@ -147,10 +155,10 @@ select
     vacancies.work_mode,
     enrichment.seniority,
     enrichment.stack,
-    enrichment.salary_min,
-    enrichment.salary_max,
-    enrichment.salary_currency,
-    enrichment.salary_period,
+    vacancies.salary_min,
+    vacancies.salary_max,
+    vacancies.salary_currency,
+    vacancies.salary_period,
     enrichment.residency_requirement,
     enrichment.summary,
     enrichment.language,

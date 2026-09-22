@@ -32,6 +32,14 @@ with enrichment as (
         residency_requirement                       as llm_residency_requirement,
         required_languages                          as llm_required_languages,
         residency_years_required                    as llm_residency_years_required,
+
+        -- Зарплата, найденная моделью в тексте. Правил по ней нет — она
+        -- нужна боту; витрина сводит её с зарплатой источника в блоке facts.
+        salary_min                                  as llm_salary_min,
+        salary_max                                  as llm_salary_max,
+        salary_currency                             as llm_salary_currency,
+        salary_period                               as llm_salary_period,
+
         enriched_at                                 as llm_enriched_at,
 
         -- Проверен ли язык: есть ли ответ промпта v5 или новее — с v5 модель
@@ -58,6 +66,8 @@ manfred_facts as (
         required_languages                          as src_required_languages,
         remote_percentage                           as src_remote_percentage,
         location_cities                             as src_location_cities,
+        salary_currency                             as src_salary_currency,
+        salary_period                               as src_salary_period,
         last_seen_at                                as src_last_seen_at,
         true                                        as has_source_facts
     from {{ ref('stg_manfred_facts') }}
@@ -222,7 +232,33 @@ facts as (
         -- придерживает language_rule — в том числе вакансию Manfred с
         -- пустым languages, пока модель недоступна. Это не обходим.
         coalesce(array_length(src_required_languages) > 0, false)
-            or coalesce(llm_has_language_check, false)  as has_language_check
+            or coalesce(llm_has_language_check, false)  as has_language_check,
+
+        -- Зарплата: тот же принцип, что выше, — источник главнее модели.
+        -- Числа salary_min и salary_max приходят из stg_vacancies, то есть
+        -- прямо из полей источника (Manfred, Adzuna, remoteok). Модель
+        -- вычитывает зарплату из текста и иногда ошибается; поле источника
+        -- компания заполнила сама.
+        --
+        -- Вилку берём ЦЕЛИКОМ с одной стороны, а не по числу: смешать
+        -- нижнюю границу источника с верхней от модели значило бы показать
+        -- вилку, которой нет ни в одном источнике.
+        case when salary_min is not null or salary_max is not null
+            then salary_min else llm_salary_min
+        end                                             as salary_min_best,
+        case when salary_min is not null or salary_max is not null
+            then salary_max else llm_salary_max
+        end                                             as salary_max_best,
+
+        -- Валюта и период — coalesce, а не «вместе с вилкой»: у источников,
+        -- кроме Manfred, чисел два, а валюты и периода нет вовсе. Без
+        -- запасного варианта бот печатал бы «45 000–55 000» без валюты.
+        -- Размен: если модель прочитала валюту неверно, ошибка ляжет рядом
+        -- с верной суммой источника. Обе величины при этом из одного
+        -- объявления, так что разойтись им особо негде.
+        coalesce(src_salary_currency, llm_salary_currency)
+                                                        as salary_currency_best,
+        coalesce(src_salary_period, llm_salary_period)  as salary_period_best
 
     from vacancies
 
@@ -707,6 +743,10 @@ select
     has_source_facts,
     src_last_seen_at,
     src_remote_percentage,
+    salary_min_best,
+    salary_max_best,
+    salary_currency_best,
+    salary_period_best,
     src_required_languages,
 
     llm_work_mode,

@@ -81,6 +81,12 @@ models:
         description: >
           Города из location по отдельности. Пустой массив — места работы нет,
           у Manfred так пишут полностью удалённые вакансии.
+      - name: salary_currency
+        description: >
+          Валюта зарплаты кодом ISO 4217: в raw она знаком («€» → EUR).
+          Незнакомый знак — null.
+      - name: salary_period
+        description: "Всегда 'year': salaryFrom и salaryTo у Manfred — годовые суммы."
       - name: last_seen_at
         description: >
           Когда вакансию последний раз видели в списке офферов: максимум

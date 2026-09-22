@@ -121,6 +121,20 @@ models:
           свежести: у Manfred её нет.
       - name: has_source_facts
         description: "true, если у вакансии есть структурные поля источника (stg_manfred_facts); иначе null."
+      - name: salary_min_best
+        description: >
+          Итоговая нижняя граница вилки: из полей источника, а если их нет —
+          найденная моделью в тексте. Вилка берётся целиком с одной стороны,
+          не по числу.
+      - name: salary_max_best
+        description: "Итоговая верхняя граница вилки, из того же источника, что salary_min_best."
+      - name: salary_currency_best
+        description: >
+          Валюта кодом ISO 4217: из источника (Manfred), иначе из ответа
+          модели. У остальных источников валюты нет вовсе, поэтому здесь
+          coalesce, а не «вместе с вилкой».
+      - name: salary_period_best
+        description: "year / month / day / hour: из источника (у Manfred всегда year), иначе из ответа модели."
       - name: src_remote_percentage
         description: "Доля удалённой работы из источника, 0–100 (только Manfred)."
       - name: src_required_languages
@@ -290,7 +304,9 @@ models:
       - name: stack
         description: "Технологии и инструменты, названные в тексте, по ответу модели."
       - name: salary_min
-        description: "Зарплата, найденная моделью в тексте. Прогноз Adzuna сюда не попадает."
+        description: >
+          Зарплата из витрины: вилка из полей источника, а если их нет —
+          найденная моделью в тексте. Прогноз Adzuna сюда не попадает.
       - name: residency_requirement
         description: "Дословное требование жить или иметь право работать в конкретной стране."
       - name: summary
