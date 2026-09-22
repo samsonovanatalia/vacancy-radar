@@ -47,7 +47,23 @@ with manfred as (
             order by position
         )                                               as location_cities,
 
-        ingested_at
+        ingested_at,
+
+        -- Когда вакансию последний раз видели в списке офферов. raw только
+        -- дописывается (WRITE_APPEND, коллектор пишет файл в режиме «a»),
+        -- поэтому на вакансию по строке за каждый день, когда она была в
+        -- списке. Нужен максимум, а не ingested_at строки: ниже qualify
+        -- оставит одну строку, и без max это была бы просто её дата.
+        --
+        -- Зачем это нужно: даты публикации у Manfred нет, а в списке
+        -- лежат только активные офферы. «Видели сегодня» — и есть
+        -- признак живости; 30-дневное окно по updatedAt держало бы
+        -- закрытую вакансию в подборке до месяца после исчезновения.
+        -- partition by по source_id, а не по vacancy_key: vacancy_key
+        -- вычисляется в этом же select, а на его псевдоним окно сослаться
+        -- не может. В пределах одного источника source_id — тот же ключ.
+        max(ingested_at) over (partition by source_id)
+                                                        as last_seen_at
 
     from {{ source('raw', 'manfred') }}
 
@@ -57,7 +73,8 @@ select
     vacancy_key,
     required_languages,
     remote_percentage,
-    location_cities
+    location_cities,
+    last_seen_at
 
 from manfred
 

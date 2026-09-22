@@ -58,6 +58,7 @@ manfred_facts as (
         required_languages                          as src_required_languages,
         remote_percentage                           as src_remote_percentage,
         location_cities                             as src_location_cities,
+        last_seen_at                                as src_last_seen_at,
         true                                        as has_source_facts
     from {{ ref('stg_manfred_facts') }}
 
@@ -143,10 +144,25 @@ vacancies as (
     -- И для структурных полей: они есть только у Manfred.
     left join manfred_facts using (vacancy_key)
 
-    -- Окно в 30 дней: столько вакансия может ждать в очереди на отправку
-    -- (mart_digest_queue). Строки без posted_at сравнение отсекает (null >= x
-    -- даёт null, а не true) — вакансию без даты считать свежей нельзя.
-    where posted_at >= timestamp_sub(current_timestamp(), interval 30 day)
+    -- Окно свежести. У большинства источников это 30 дней от публикации:
+    -- столько вакансия может ждать в очереди на отправку (mart_digest_queue).
+    -- Строки без posted_at сравнение отсекает (null >= x даёт null, а не
+    -- true) — вакансию без даты считать свежей нельзя.
+    --
+    -- У Manfred даты публикации нет вовсе: коллектор кладёт в неё updatedAt,
+    -- а он бывает четырёхлетней давности у открытой вакансии. Зато список
+    -- офферов отдаёт ТОЛЬКО активные, поэтому живость там — «вакансию видели
+    -- в списке» (src_last_seen_at из stg_manfred_facts).
+    --
+    -- Допуск двое суток, а не сутки: сбор идёт раз в день, и один упавший
+    -- прогон не должен выносить из подборки весь источник. Обратная сторона
+    -- — закрытая вакансия живёт в подборке ещё день. По updatedAt она жила бы
+    -- до месяца, а половина офферов не попадала бы в подборку вовсе.
+    where case
+              when source = 'manfred'
+                  then src_last_seen_at >= timestamp_sub(current_timestamp(), interval 2 day)
+              else posted_at >= timestamp_sub(current_timestamp(), interval 30 day)
+          end
 
 ),
 
@@ -689,6 +705,7 @@ select
     required_languages,
     has_language_check,
     has_source_facts,
+    src_last_seen_at,
     src_remote_percentage,
     src_required_languages,
 

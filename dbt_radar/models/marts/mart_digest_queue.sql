@@ -52,14 +52,24 @@ with vacancies as (
         work_mode,
         location_city,
 
+        -- Когда вакансию Manfred последний раз видели в списке офферов.
+        -- У остальных источников null: это признак живости только там.
+        src_last_seen_at,
+
         -- На чём основано решение о живости. Решает источник, а не то, есть
         -- ли у вакансии строка в stg_vacancy_pages: у вакансии Adzuna, до
         -- которой проверка ещё не дошла, строки нет, но судить о ней по дате
         -- нельзя — проверка для Adzuna есть, а без неё вакансию не берём.
         -- Страницы сейчас скачиваются только для Adzuna (fetch/adzuna_pages.py).
         -- Появится проверка у другого источника — дописать его в список.
+        --
+        -- У Manfred проверка своя и другого рода: вакансия жива, пока она
+        -- есть в списке офферов (там только активные). Поэтому отдельное
+        -- значение listed_in_source, а не 'checked': проверки разные, и в
+        -- витрине должно быть видно, какая именно сработала.
         case
             when source in ('adzuna') then 'checked'
+            when source = 'manfred'   then 'listed_in_source'
             else 'assumed_by_date'
         end                                         as liveness_basis
 
@@ -186,6 +196,11 @@ where not coalesce(pages.is_dead, false)
   --     прогон.
   --     Не проверялась — last_checked_at null, сравнение даёт null, и where
   --     строку отбрасывает. Это и нужно: непроверенную не берём.
+  --   listed_in_source — вакансию видели в списке офферов Manfred не
+  --     позже двух суток назад. Тот же порог, что в окне свежести
+  --     mart_vacancies_scored: сбор идёт раз в день, и запас в двое суток
+  --     переживает один упавший прогон. Даты публикации у Manfred нет,
+  --     судить по updatedAt нельзя — он бывает четырёхлетней давности.
   --   assumed_by_date — проверять нечем, заменитель — дата публикации:
   --     не старше 30 дней. mart_vacancies_scored сейчас и так берёт только
   --     30 дней, но условие пишем явно — по той же причине, что is_dead выше.
@@ -195,6 +210,8 @@ where not coalesce(pages.is_dead, false)
   and case vacancies.liveness_basis
         when 'checked'
             then pages.last_checked_at >= timestamp_sub(current_timestamp(), interval 3 day)
+        when 'listed_in_source'
+            then vacancies.src_last_seen_at >= timestamp_sub(current_timestamp(), interval 2 day)
         when 'assumed_by_date'
             then vacancies.posted_at >= timestamp_sub(current_timestamp(), interval 30 day)
       end
