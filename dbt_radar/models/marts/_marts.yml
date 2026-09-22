@@ -69,6 +69,17 @@ models:
           false, если английских служебных слов меньше 5 на 100 слов в первых
           2000 символах чистого описания (description_clean) или в заголовке
           есть (m/w/d), (m/f/d), (w/m/d).
+      - name: is_russian
+        description: >
+          true, если не меньше половины слов в первых 2000 символах
+          description_clean содержат кириллицу.
+      - name: is_awaiting_language_check
+        description: >
+          Объявление не на английском и не на русском (not is_english and not
+          is_russian), и модель ещё не проверила его: нет ответа промпта v5
+          или новее. Такая вакансия придерживается как awaiting_language_check,
+          пока её не обогатят; после этого за язык решает
+          foreign_language_required.
       - name: location_fit
         description: "spain / remote / other — по location и is_remote. Только для балла, не исключает."
       - name: is_agency
@@ -99,9 +110,9 @@ models:
           (промпт v5). null — требования нет или вакансия не обогащена.
       - name: is_foreign_language_required
         description: >
-          В llm_required_languages есть хоть один язык с кодом, отличным от en.
-          Уровень не учитывается, английский не учитывается вовсе. false —
-          таких языков нет или вакансия не обогащена. Такая вакансия
+          В llm_required_languages есть хоть один язык с кодом, кроме en и ru.
+          Уровень не учитывается, английский и русский не учитываются вовсе.
+          false — таких языков нет или вакансия не обогащена. Такая вакансия
           исключается как foreign_language_required.
       - name: is_residency_too_long
         description: >
@@ -110,12 +121,14 @@ models:
           residency_too_long.
       - name: excluded_reason
         description: >
-          Первое сработавшее правило: wrong_seniority → not_english →
+          Первое сработавшее правило: wrong_seniority →
           duplicate (company_core + title_key) → irrelevant_role →
           dead (страница вакансии отдала 404, см. stg_vacancy_pages) →
           non_data_role (заголовок продаж, работы с клиентами или найма) →
+          awaiting_language_check (не на английском и не на русском, модель
+          ещё не проверила, см. is_awaiting_language_check) →
           foreign_language_required (модель нашла требование языка, кроме
-          английского, см. is_foreign_language_required) →
+          английского и русского, см. is_foreign_language_required) →
           residency_too_long (требуют больше года проживания в стране, см.
           is_residency_too_long) → wrong_location (не Барселона и не полная
           удалёнка, см. is_wrong_location). null — вакансия проходит
@@ -150,7 +163,7 @@ models:
         description: >
           Прошла правила исключения, проверяемые без модели: грейд, роль,
           заголовок не про данные, мёртвая страница, дубль. Правила, которые
-          зависят от модели или языка (not_english, foreign_language_required,
+          зависят от модели или языка (awaiting_language_check, foreign_language_required,
           residency_too_long, wrong_location), кандидатов не отсекают.
           По этому флагу fetch/adzuna_pages.py качает страницы.
         tests:
@@ -244,6 +257,10 @@ models:
         description: "Дословное требование жить или иметь право работать в конкретной стране."
       - name: summary
         description: "Суть вакансии в 2–3 предложениях от модели."
+      - name: language
+        description: >
+          Язык объявления, ISO 639-1, по ответу модели. Если не en, бот пишет
+          строку «Объявление на …». null — вакансия не обогащена.
       - name: url
         description: "Ссылка на вакансию в источнике."
         tests:

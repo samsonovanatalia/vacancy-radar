@@ -145,7 +145,14 @@ BATCH_SIZE = 10
 #        каком уровне) и residency_years_required (сколько лет проживания
 #        в стране требуют). Правил исключения по ним пока нет — сначала
 #        смотрим, что модель находит.
-PROMPT_VERSION = "v5"
+#   v6 — текстовые поля по-английски независимо от языка объявления:
+#        переводить, а не переписывать оригинал. С 2026-09-22 к модели идут
+#        и испанские, и немецкие объявления — раньше их отсекал not_english
+#        до обогащения, и правило «пиши по-английски» почти не проверялось:
+#        на v5 неанглийских объявлений было всего 5 (все пять ответов
+#        по-английски). Правило в промпте было и раньше, v6 делает его явным
+#        для объявлений на другом языке — теперь таких будут десятки.
+PROMPT_VERSION = "v6"
 
 PROMPT = """\
 You extract facts from a job posting. You receive a "Known fields" block
@@ -158,7 +165,9 @@ Rules:
   If neither gives data for a field, leave it empty: null, an empty list for
   list fields, "unclear" for work_mode.
 - Write summary, responsibilities, requirements and benefits in English,
-  short and concrete.
+  short and concrete, whatever language the posting is written in. If the
+  posting is in Spanish, German or any other language, translate: do not
+  copy its sentences in the original language.
 - summary: 2-3 sentences on the concrete tasks of the job. Do not retell the
   company introduction or advertising phrases. If the description has no
   concrete tasks, return exactly this text: в описании нет конкретных задач
@@ -452,6 +461,14 @@ def fetch_candidates(
     #
     # `@source is null or ...` — один запрос на оба случая: без флага
     # параметр null, условие истинно для всех строк, фильтра нет.
+    #
+    # Порядок: сначала вакансии, у которых нет НИКАКОГО ответа, потом те, что
+    # обогащены старой версией промпта (false сортируется раньше true).
+    # После поднятия версии в кандидатах разом оказываются все вакансии, и
+    # при сортировке только по баллу необогащённые — а среди них те, кого
+    # dbt придерживает как awaiting_language_check, — ждали бы, пока модель
+    # перечитает сотни уже обогащённых. Старый ответ у тех хоть какой-то
+    # есть, у новых — никакого.
     query = f"""
         select
             s.vacancy_key,
@@ -473,7 +490,14 @@ def fetch_candidates(
               where e.vacancy_key = s.vacancy_key
                 and e.prompt_version = '{PROMPT_VERSION}'
           )
-        order by s.relevance_score desc, s.posted_at desc
+        order by
+            exists (
+                select 1
+                from `{project}.{RAW_DATASET}.{TABLE_NAME}` as e
+                where e.vacancy_key = s.vacancy_key
+            ),
+            s.relevance_score desc,
+            s.posted_at desc
         limit {limit}
     """
     job_config = bigquery.QueryJobConfig(

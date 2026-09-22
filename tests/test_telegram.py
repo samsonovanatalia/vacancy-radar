@@ -107,6 +107,7 @@ def make_vacancy(scenario: str, **fields) -> dict:
         "salary_period": None,
         "residency_requirement": None,
         "summary": None,
+        "language": None,
         "url": f"https://example.com/jobs/{scenario}",
     }
     vacancy.update(fields)
@@ -199,6 +200,7 @@ class SendDigestTest(unittest.TestCase):
             salary_period="year",
             residency_requirement="Must be based in Spain.",
             summary="Build dashboards. Write SQL. Talk to stakeholders.",
+            language="en",
             url="https://example.com/jobs/ok?utm_medium=api&utm_source=x",
         )
         sparse = make_vacancy(
@@ -208,6 +210,7 @@ class SendDigestTest(unittest.TestCase):
             seniority="unclear",
             salary_min=35000.0,
             salary_currency="EUR",
+            language="es",
         )
         log, exit_message = self.run_send([full, sparse])
 
@@ -231,10 +234,12 @@ class SendDigestTest(unittest.TestCase):
             '<a href="https://example.com/jobs/ok?utm_medium=api&amp;utm_source=x">Открыть вакансию</a>'
         ))
         # unclear, пустой стек и пустые поля не печатаются совсем — ни «—», ни «None».
+        # Язык en строки не даёт (full_text выше), es — даёт.
         self.assertEqual(sparse_text, (
             "<b>Data Analyst</b>\n"
             "Компания: Perk\n"
             "Зарплата: от 35 000 EUR\n"
+            "Объявление на испанском\n"
             "\n"
             '<a href="https://example.com/jobs/ok#2">Открыть вакансию</a>'
         ))
@@ -382,6 +387,15 @@ class SendDigestTest(unittest.TestCase):
         # Урезали не молча: в логе сказано, почему не size и как поднять.
         self.assertIn("поднять потолок можно только флагом --catch-up", log)
         self.assertNotIn("догоняющий прогон", log)
+
+    def test_format_language(self) -> None:
+        """Строка о языке: только для неанглийского объявления с известным языком."""
+        self.assertIsNone(tg.format_language(None))
+        self.assertIsNone(tg.format_language("en"))
+        self.assertEqual(tg.format_language("es"), "Объявление на испанском")
+        self.assertEqual(tg.format_language("ru"), "Объявление на русском")
+        # Кода нет в словаре — не молчим и не гадаем, печатаем как есть.
+        self.assertEqual(tg.format_language("sv"), "Объявление не на английском (sv)")
 
     def test_batch_limit(self) -> None:
         """Число опускает лимит всегда, поднимает — только вместе с --catch-up."""

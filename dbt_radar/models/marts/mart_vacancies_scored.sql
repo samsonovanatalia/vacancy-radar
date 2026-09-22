@@ -32,7 +32,18 @@ with enrichment as (
         residency_requirement                       as llm_residency_requirement,
         required_languages                          as llm_required_languages,
         residency_years_required                    as llm_residency_years_required,
-        enriched_at                                 as llm_enriched_at
+        enriched_at                                 as llm_enriched_at,
+
+        -- Проверен ли язык: есть ли ответ промпта v5 или новее — с v5 модель
+        -- возвращает required_languages. Именно «v5 или новее», а не «текущей
+        -- версии»: иначе каждое поднятие версии промпта разом отправляло бы
+        -- все неанглийские вакансии на удержание, пока их не обогатят заново.
+        --
+        -- Номер сравниваем числом, а не строкой: строкой 'v10' < 'v5'.
+        -- stg_enrichment оставляет самый свежий ответ, а версии со временем
+        -- только растут, так что «свежий ответ ≥ v5» = «есть ответ ≥ v5».
+        coalesce(safe_cast(substr(prompt_version, 2) as int64) >= 5, false)
+                                                    as llm_has_language_check
     from {{ ref('stg_enrichment') }}
 
 ),
@@ -181,6 +192,23 @@ features as (
                 r'\((?:m\s*/\s*w\s*/\s*d|m\s*/\s*f\s*/\s*d|w\s*/\s*m\s*/\s*d)\)')
                                                         as is_english,
 
+        -- Русская ли вакансия: не меньше половины слов в начале текста
+        -- содержат кириллицу. Служебные слова, как у is_english, здесь не
+        -- нужны: кириллицу в тексте на другом языке почти не встретишь, и
+        -- одна эта примета отделяет русский текст надёжно. Половина, а не
+        -- «хоть одно слово» — чтобы английский текст с русским названием
+        -- компании не стал русским.
+        coalesce(safe_divide(
+            array_length(regexp_extract_all(
+                substr(coalesce(description_clean, ''), 1, 2000),
+                r'\S*[а-яА-ЯёЁ]\S*'
+            )),
+            array_length(regexp_extract_all(
+                substr(coalesce(description_clean, ''), 1, 2000),
+                r'\S+'
+            ))
+        ), 0) >= 0.5                                    as is_russian,
+
         -- География. Ветка spain стоит первой: вакансия в Барселоне
         -- с пометкой remote получит 'spain' — это более сильный сигнал.
         -- coalesce: у Adzuna is_remote всегда null, location бывает пустой.
@@ -242,18 +270,23 @@ features as (
             r'\b(account executive|sales|business development|account manager|customer success|recruiter)\b')
                                                         as is_non_data_title,
 
-        -- Требуется язык, кроме английского (поле промпта v5). Уровень не
-        -- смотрим: «будет плюсом» модель в список не берёт, так что сам факт
-        -- попадания языка в список уже значит требование. Английский не
-        -- проверяем вовсе: на 15.09.2026 он есть в 22 списках из 23, отсекать
-        -- им нечего.
+        -- Требуется язык, кроме английского и русского (поле промпта v5):
+        -- на рабочем уровне у меня только эти два. Испанский базовый,
+        -- французский средний — для требования в вакансии ни тот, ни другой
+        -- не годятся, поэтому уровень не смотрим: «будет плюсом» модель в
+        -- список не берёт, так что сам факт попадания языка в список уже
+        -- значит требование. Английский и русский не проверяем: на
+        -- 15.09.2026 английский есть в 22 списках из 23, отсекать им нечего.
+        -- С 2026-09-22 это правило решает за язык и у вакансий, написанных
+        -- не на английском (см. language_rule), — раньше их отсекал
+        -- not_english по языку текста.
         -- lower: модель просили код ISO 639-1, но «EN» и «en» не должны
         -- разойтись. Обогащения нет — llm_required_languages null, unnest
         -- даёт ноль строк, и exists честно возвращает false, а не null.
         exists (
             select 1
             from unnest(llm_required_languages) as l
-            where lower(l.language) != 'en'
+            where lower(l.language) not in ('en', 'ru')
         )                                               as is_foreign_language_required,
 
         -- Требуют больше года проживания в стране (поле промпта v5).
@@ -263,6 +296,36 @@ features as (
         coalesce(llm_residency_years_required > 1, false) as is_residency_too_long
 
     from vacancies
+
+),
+
+language_rule as (
+
+    -- ЯЗЫКОВОЕ ПРАВИЛО с 2026-09-22. Язык объявления сам по себе больше
+    -- не причина исключения: испанская вакансия в Барселоне может не
+    -- требовать испанского. Решает то, ЧТО требуют (required_languages,
+    -- правило foreign_language_required), а не на чём написано.
+    --   - на английском или русском — проходит, как раньше;
+    --   - на другом языке, язык уже проверен моделью (ответ v5+) —
+    --     решает foreign_language_required;
+    --   - на другом языке и не проверен — придерживаем
+    --     (awaiting_language_check), пока модель не прочитает. Пропускать
+    --     непроверенную нельзя: в дайджест утекла бы вакансия с
+    --     обязательным испанским.
+    -- Придержанная вакансия — кандидат на обогащение (язык к правилам без
+    -- модели не относится), поэтому ждёт она обычно до следующего
+    -- утреннего прогона.
+    --
+    -- Отдельный блок, потому что в одном select нельзя сослаться на
+    -- колонки is_english и is_russian, которые в нём же и вычисляются.
+    select
+        *,
+        not is_english
+            and not is_russian
+            and not coalesce(llm_has_language_check, false)
+                                                        as is_awaiting_language_check
+
+    from features
 
 ),
 
@@ -305,7 +368,7 @@ fits_location_rule as (
             else 'unclear'
         end                                             as fits_location
 
-    from features
+    from language_rule
 
 ),
 
@@ -370,10 +433,15 @@ ranked as (
         -- Первые ключи сортировки — «вакансию всё равно исключит другое
         -- правило»: сначала мёртвая ли она, потом исключённые грейд, язык и
         -- заголовок не про данные.
+        -- Язык с 2026-09-22 сам не исключает (см. language_rule), но в
+        -- сортировке остался как предпочтение: английская копия проходит
+        -- сразу, а неанглийская ждёт проверки модели. Язык текста известен
+        -- у всех копий, так что сортировать по нему можно — в отличие от
+        -- ответов модели, см. следующий абзац.
         --
         -- Правил по ответам модели (foreign_language_required,
         -- residency_too_long) здесь нет намеренно. Модель обогащает только
-        -- вакансии из подборки, то есть победителя дедупа; у его копий ответа
+        -- кандидатов (enrichment_rule), то есть победителя дедупа; у его копий ответа
         -- нет, и флаг у них всегда false. Поставь флаг в сортировку — и
         -- обогащённая копия с требованием языка проиграет необогащённой: та
         -- займёт её место в подборке без проверки, а у первой причиной станет
@@ -434,8 +502,9 @@ enrichment_rule as (
     --   - проверяемые без модели: грейд, роль, заголовок не про данные,
     --     мёртвая страница, дубль. Ответ на них есть у каждой вакансии
     --     сразу после сбора;
-    --   - зависящие от ответа модели или от языка: not_english,
-    --     foreign_language_required, residency_too_long, wrong_location.
+    --   - зависящие от ответа модели или от языка: awaiting_language_check
+    --     (до 2026-09-22 — not_english), foreign_language_required,
+    --     residency_too_long, wrong_location.
     -- Кандидат на обогащение — вакансия, прошедшая правила ПЕРВОГО вида.
     -- Правила второго вида кандидатов не отсекают: иначе модель никогда не
     -- увидит вакансию, про которую как раз она и должна ответить. Так было
@@ -525,6 +594,7 @@ select
     role_type,
     seniority,
     is_english,
+    is_russian,
     location_fit,
     is_barcelona,
     is_agency,
@@ -539,6 +609,7 @@ select
     is_foreign_language_required,
     is_residency_too_long,
     is_wrong_location,
+    is_awaiting_language_check,
 
     -- Номер копии в группе дублей и признак мёртвой страницы. Нужны снаружи,
     -- чтобы по витрине было видно, из чего сложился is_enrichment_candidate.
@@ -549,6 +620,17 @@ select
 
     -- Первое сработавшее правило. Если не сработало ни одно, case без else
     -- вернёт null — это и значит «вакансия проходит в подборку».
+    --
+    -- Сверху правила без модели, ниже — зависящие от модели и языка.
+    --
+    -- not_english с 2026-09-22 нет: язык объявления больше не исключает.
+    -- Вместо него awaiting_language_check — «на другом языке и модель ещё
+    -- не проверила, какой язык требуют» (блок language_rule). Стоит сразу
+    -- после правил без модели, а не на месте not_english (второй строкой):
+    -- удержание — временное состояние, и испанская вакансия с чужой ролью
+    -- должна уйти как irrelevant_role, навсегда, а не висеть в ожидании.
+    -- Заодно число awaiting_language_check честно равно «сколько ждёт
+    -- модели и потом, возможно, придёт в подборку».
     --
     -- dead — страница вакансии отдала 404 (stg_vacancy_pages). У вакансий без
     -- скачанной страницы is_dead null: when null не срабатывает, как false.
@@ -572,11 +654,11 @@ select
     -- станет читать географию раньше остальных причин.
     case
         when seniority in ('lead', 'junior')    then 'wrong_seniority'
-        when not is_english                     then 'not_english'
         when dedup_rank > 1                     then 'duplicate'
         when role_type = 'other'                then 'irrelevant_role'
         when is_dead                            then 'dead'
         when is_non_data_title                  then 'non_data_role'
+        when is_awaiting_language_check         then 'awaiting_language_check'
         when is_foreign_language_required       then 'foreign_language_required'
         when is_residency_too_long              then 'residency_too_long'
         when is_wrong_location                  then 'wrong_location'

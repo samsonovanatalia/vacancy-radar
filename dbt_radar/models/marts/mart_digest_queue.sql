@@ -89,6 +89,10 @@ enrichment as (
         salary_period,
         residency_requirement,
         summary,
+        -- Язык объявления (ISO 639-1) по ответу модели. Бот пишет
+        -- «Объявление на испанском», если он не английский: с 2026-09-22
+        -- в подборку проходят и объявления на других языках.
+        language,
         prompt_version
     from {{ ref('stg_enrichment') }}
 
@@ -134,6 +138,7 @@ select
     enrichment.salary_period,
     enrichment.residency_requirement,
     enrichment.summary,
+    enrichment.language,
     vacancies.url,
     vacancies.relevance_score,
     vacancies.description_source,

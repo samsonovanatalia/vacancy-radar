@@ -129,6 +129,21 @@ SUMMARY_SENTENCES = 2
 WORK_MODE_LABELS = {"remote": "удалённо", "hybrid": "гибрид", "onsite": "офис"}
 SALARY_PERIOD_LABELS = {"year": "в год", "month": "в месяц", "day": "в день", "hour": "в час"}
 
+# Язык объявления (ISO 639-1 из ответа модели) → слово для строки
+# «Объявление на испанском». Только те языки, что встречаются в наших
+# источниках; незнакомый код печатается как есть — см. format_language.
+LANGUAGE_LABELS = {
+    "es": "испанском",
+    "ca": "каталанском",
+    "de": "немецком",
+    "fr": "французском",
+    "nl": "нидерландском",
+    "pt": "португальском",
+    "it": "итальянском",
+    "pl": "польском",
+    "ru": "русском",
+}
+
 # Схема явная, как в остальных модулях, и та же, что в sql/raw_digest_sent.sql.
 TABLE_SCHEMA = [
     bigquery.SchemaField("vacancy_key", "STRING", mode="REQUIRED"),
@@ -224,6 +239,7 @@ def fetch_queue(bq: bigquery.Client, project: str) -> list[dict]:
             d.salary_period,
             d.residency_requirement,
             d.summary,
+            d.language,
             d.url
         from `{project}.{MARTS_DATASET}.mart_digest_queue` as d
         where not exists (
@@ -274,6 +290,18 @@ def format_salary(vacancy: dict) -> str | None:
     return " ".join(part for part in parts if part)
 
 
+def format_language(code: str | None) -> str | None:
+    """«Объявление на испанском» для неанглийского объявления; None для английского или неизвестного."""
+    # С 2026-09-22 в подборку проходят объявления на любом языке, если
+    # модель не нашла требования чужого языка. Пометка — чтобы открыть
+    # ссылку и не удивиться испанскому тексту.
+    # None — вакансия не обогащена: язык неизвестен, молчим, а не гадаем.
+    if not code or code == "en":
+        return None
+    label = LANGUAGE_LABELS.get(code)
+    return f"Объявление на {label}" if label else f"Объявление не на английском ({code})"
+
+
 def format_header(day: date, sending: int, in_queue: int) -> str:
     """Шапка: «вакансий: 10» или, если очередь длиннее лимита, «вакансий: 25 из 64, остальные завтра»."""
     if sending == in_queue:
@@ -315,6 +343,10 @@ def format_vacancy(vacancy: dict) -> str:
     # становится &amp;, и Telegram превращает его обратно.
     lines = [f"<b>{html.escape(vacancy['title'], quote=False)}</b>"]
     lines += [f"{label}: {html.escape(value, quote=False)}" for label, value in fields if value]
+    language = format_language(vacancy["language"])
+    if language:
+        # Код языка пришёл от модели — экранируем, как всё из данных.
+        lines.append(html.escape(language, quote=False))
     if vacancy["summary"]:
         summary = first_sentences(vacancy["summary"], SUMMARY_SENTENCES)
         lines += ["", html.escape(summary, quote=False)]
