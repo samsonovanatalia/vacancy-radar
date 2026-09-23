@@ -169,6 +169,15 @@ models:
           llm_residency_years_required больше 1. false — год и меньше, требования
           нет или вакансия не обогащена. Такая вакансия исключается как
           residency_too_long.
+      - name: is_residency_outside_spain
+        description: >
+          В требовании к резидентству от модели названа конкретная страна, и
+          это не Испания: нет ни Испании, ни ЕС / Европы. Фраза без названной
+          страны («territorio nacional», «country of your choice») — false:
+          это незнание, а не запрет. false и когда требования нет или вакансия
+          не обогащена. Такая вакансия исключается как residency_outside_spain.
+        tests:
+          - not_null
       - name: excluded_reason
         description: >
           Первое сработавшее правило: wrong_seniority →
@@ -181,8 +190,9 @@ models:
           английского и русского, см. is_foreign_language_required) →
           residency_too_long (требуют больше года проживания в стране, см.
           is_residency_too_long) → wrong_location (не Барселона и не полная
-          удалёнка, см. is_wrong_location). null — вакансия проходит
-          в подборку.
+          удалёнка, см. is_wrong_location) → residency_outside_spain
+          (требуют жить в другой стране, см. is_residency_outside_spain).
+          null — вакансия проходит в подборку.
       - name: is_barcelona
         description: >
           Барселона по двум полям сразу: llm_location_city из обогащения и
@@ -199,7 +209,8 @@ models:
         description: >
           Эвристика релевантности: за роль +4 analytics_engineer, +3 analyst,
           +2 product_analyst, +1 data_engineer; +2 spain / +1 remote
-          по location_fit, +3 / −5 за fits_location yes / no, −2 за senior,
+          по location_fit, +3 за fits_location yes (за no штрафа нет —
+          неподходящую локацию исключают правила), −2 за senior,
           +1 за указанную зарплату.
       - name: dedup_rank
         description: >

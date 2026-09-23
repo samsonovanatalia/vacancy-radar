@@ -428,7 +428,43 @@ features as (
         -- coalesce: требования нет или обогащения нет — сравнение даёт null,
         -- а нужен честный false. Иначе null в сортировке дедупа ниже встал бы
         -- раньше false и сдвинул бы, какая копия вакансии остаётся.
-        coalesce(llm_residency_years_required > 1, false) as is_residency_too_long
+        coalesce(llm_residency_years_required > 1, false) as is_residency_too_long,
+
+        -- Требуют жить в другой стране, не в Испании (с 2026-09-23). До этого
+        -- то же условие было веткой fits_location и давало −5 к баллу: жёсткого
+        -- правила не было, и удалёнку «только UK» держал в стороне один штраф.
+        -- Теперь здесь исключение, а балл только поощряет.
+        --
+        -- Срабатывает, только если выполнены оба условия:
+        --   1. в требовании НАЗВАНА конкретная страна — «UK only», «Portugal
+        --      or Germany», «innerhalb Deutschlands»;
+        --   2. в нём нет ничего, под что подходит житель Барселоны: Испании,
+        --      ЕС, Европы. «UK or EU» → false.
+        -- Условие 1 — тот же принцип, что у локации: фрагмент исключает,
+        -- только если он что-то называет. Фраза без страны — незнание, а не
+        -- запрет. Так не срабатывают «territorio nacional», «country of your
+        -- choice» и вырванный из FAQ ответ Fossil «por razones
+        -- administrativas no es posible» (вопрос был про жизнь вне Испании).
+        --
+        -- Список стран — те, что встречаются в требованиях на 2026-09-23, и
+        -- крупные соседние рынки. Вакансию со страной не из списка правило
+        -- пропустит — это промах в сторону «показать лишнюю», а не
+        -- «потерять подходящую». Только город (Berlin, London) правило не
+        -- ловит: такие вакансии исключает wrong_location.
+        -- \buk\b с границами слова, иначе совпадёт внутри слов; «us» не
+        -- берём вовсе — это английское местоимение.
+        -- coalesce: требования нет — regexp даёт null, а нужен честный false.
+        coalesce(
+            regexp_contains(
+                lower(llm_residency_requirement),
+                r'\buk\b|united kingdom|britain|england|scotland|ireland|portugal|germany|deutschland|alemania|france|francia|netherlands|holland|belgium|switzerland|austria|italy|italia|poland|sweden|denmark|norway|finland|estonia|israel|united states|\busa\b|canada|mexico|méxico|brazil|brasil|argentina|colombia|india|japan|australia'
+            )
+            and not regexp_contains(
+                lower(llm_residency_requirement),
+                r'spain|españa|espana|spanish|español|espanol|barcelona|madrid|\beu\b|european union|europe|emea'
+            ),
+            false
+        )                                               as is_residency_outside_spain
 
     from facts
 
@@ -478,11 +514,12 @@ fits_location_rule as (
     --   5. офис, и город известен      → no (раз дошли сюда, не Барселона)
     --   6. всё остальное               → unclear
     -- Ветка 3 стоит перед 4 намеренно: так «remote без требования жить вне
-    -- Испании» получается само, и условие про резидентство пишется один раз.
+    -- Испании» получается само. Условие про резидентство живёт в одном
+    -- месте — is_residency_outside_spain, — здесь только ссылка на него.
     --
-    -- «Не в Испании» определяем грубо: требование есть, и в нём нет ни
-    -- одного слова, под которое подходит житель Барселоны. «Must be based
-    -- in the UK» → no; «right to work in the EU» → не no.
+    -- С 2026-09-23 'no' на балл не влияет: что не подходит по географии,
+    -- исключают жёсткие правила (wrong_location, residency_outside_spain),
+    -- а балл только поощряет за 'yes'. 'no' оставлен как пояснение.
     select
         *,
         case
@@ -490,11 +527,7 @@ fits_location_rule as (
                 then null
             when regexp_contains(lower(coalesce(location_city, '')), r'barcelona')
                 then 'yes'
-            when llm_residency_requirement is not null
-                 and not regexp_contains(
-                     lower(llm_residency_requirement),
-                     r'spain|españa|espana|spanish|barcelona|madrid|\beu\b|european union|europe|emea'
-                 )
+            when is_residency_outside_spain
                 then 'no'
             when work_mode = 'remote'
                 then 'yes'
@@ -515,7 +548,7 @@ wrong_location_rule as (
     --
     -- Зачем отдельное правило, а не fits_location выше. fits_location
     -- отвечает на другой вопрос — «насколько локация мне подходит» — и
-    -- влияет только на балл (+3 / −5). В него подмешано требование к
+    -- влияет только на балл (+3 за 'yes'). В него подмешано требование к
     -- резидентству, а гибрид в чужом городе даёт у него 'unclear', то есть
     -- «не знаю». Здесь же нужен жёсткий да/нет по географии. Размен: два
     -- признака про локацию рядом; взамен каждый читается и меняется
@@ -757,6 +790,7 @@ select
     fits_location,
     is_foreign_language_required,
     is_residency_too_long,
+    is_residency_outside_spain,
     is_wrong_location,
     is_awaiting_language_check,
 
@@ -811,6 +845,9 @@ select
         when is_foreign_language_required       then 'foreign_language_required'
         when is_residency_too_long              then 'residency_too_long'
         when is_wrong_location                  then 'wrong_location'
+        -- С 2026-09-23. Последним по той же договорённости, что wrong_location:
+        -- множество строк с этой причиной — ровно то, что правило унесло.
+        when is_residency_outside_spain         then 'residency_outside_spain'
     end                                                 as excluded_reason,
 
     -- Балл считаем для всех строк, в том числе исключённых: так при сверке
@@ -831,9 +868,11 @@ select
           end
         -- Локация по фактам от модели. Обогащения нет → fits_location null →
         -- ветка else → 0, и балл ровно такой же, как до появления модели.
+        -- Только поощрение: штраф −5 за 'no' убран 2026-09-23. Жёсткое правило
+        -- исключает, балл только поощряет — за то, что уже отсеивают
+        -- wrong_location и residency_outside_spain, второй раз не штрафуем.
         + case fits_location
             when 'yes' then 3
-            when 'no'  then -5
             else 0
           end
         - case when seniority = 'senior' then 2 else 0 end
