@@ -403,6 +403,21 @@ features as (
             r'\b(account executive|sales|business development|account manager|customer success|recruiter)\b')
                                                         as is_non_data_title,
 
+        -- Работодатель нанимает почасово размечать или оценивать данные
+        -- для обучения ИИ (с 2026-09-24). Это не работа аналитика, хотя
+        -- заголовок бывает «EViews Specialist - Data Analyst» (Mercor) или
+        -- «Online Data Analyst» (TELUS): по заголовку их не отличить,
+        -- поэтому опознаём по работодателю.
+        --
+        -- Список короткий и закрытый, как юридические суффиксы в
+        -- normalize_company_name: дописываем, только увидев нового такого
+        -- работодателя в данных. Угадывать заранее не пытаемся — широкий
+        -- список отсёк бы настоящие вакансии.
+        -- По company_core: название уже нормализовано, «TELUS Digital» и
+        -- «TELUS Digital Europe» — это «telus digital…», и ^telus\b ловит оба.
+        regexp_contains(coalesce(company_core, ''), r'^(mercor|telus)\b')
+                                                        as is_crowdsourcing_employer,
+
         -- Требуется язык, кроме английского и русского (поле промпта v5):
         -- на рабочем уровне у меня только эти два. Испанский базовый,
         -- французский средний — для требования в вакансии ни тот, ни другой
@@ -714,6 +729,9 @@ enrichment_rule as (
         *,
         role_type != 'other'
             and not is_non_data_title
+            -- Микрозадачи не рынок аналитики: в mart_salary они были
+            -- единственными строками в USD за час и тянули статистику.
+            and not is_crowdsourcing_employer
             and dedup_rank = 1                          as is_market_vacancy
 
     from ranked
@@ -786,6 +804,7 @@ select
     is_barcelona,
     is_agency,
     is_non_data_title,
+    is_crowdsourcing_employer,
 
     -- Итоговые факты (блок facts): поле источника, а где его нет — модель.
     work_mode,
@@ -842,6 +861,10 @@ select
     -- (is_non_data_title). После dead, чтобы у остальных вакансий причина
     -- исключения не поменялась.
     --
+    -- crowdsourcing_role — работодатель из закрытого списка микрозадач для
+    -- обучения ИИ (is_crowdsourcing_employer). Сразу после non_data_role: это
+    -- тоже правило без модели.
+    --
     -- foreign_language_required и residency_too_long — правила по полям
     -- промпта v5 (is_foreign_language_required, is_residency_too_long). В конец
     -- по той же причине: у вакансий, которые уже исключало другое правило,
@@ -861,6 +884,10 @@ select
         when role_type = 'other'                then 'irrelevant_role'
         when is_dead                            then 'dead'
         when is_non_data_title                  then 'non_data_role'
+        -- С 2026-09-24. Среди правил без модели, а не в конце: испанская
+        -- вакансия TELUS должна уйти сразу и навсегда, а не висеть в
+        -- awaiting_language_check, пока её прочитает модель.
+        when is_crowdsourcing_employer          then 'crowdsourcing_role'
         when is_awaiting_language_check         then 'awaiting_language_check'
         when is_foreign_language_required       then 'foreign_language_required'
         when is_residency_too_long              then 'residency_too_long'

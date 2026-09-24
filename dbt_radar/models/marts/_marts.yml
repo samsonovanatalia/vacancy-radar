@@ -214,6 +214,15 @@ models:
           В заголовке слова продаж, работы с клиентами или найма: account executive,
           sales, business development, account manager, customer success, recruiter.
           Такая вакансия исключается как non_data_role.
+      - name: is_crowdsourcing_employer
+        description: >
+          Работодатель из закрытого списка тех, кто почасово нанимает размечать
+          или оценивать данные для обучения ИИ: mercor, telus (по company_core).
+          Список расширяется, только когда такой работодатель появится в данных.
+          Такая вакансия исключается как crowdsourcing_role и не входит в рынок
+          (is_market_vacancy).
+        tests:
+          - not_null
       - name: work_mode
         description: >
           Итоговый формат работы: из структурного поля источника (у Manfred —
@@ -304,6 +313,8 @@ models:
           duplicate (company_core + title_key) → irrelevant_role →
           dead (страница вакансии отдала 404, см. stg_vacancy_pages) →
           non_data_role (заголовок продаж, работы с клиентами или найма) →
+          crowdsourcing_role (микрозадачи для обучения ИИ, см.
+          is_crowdsourcing_employer) →
           awaiting_language_check (не на английском и не на русском, модель
           ещё не проверила, см. is_awaiting_language_check) →
           foreign_language_required (модель нашла требование языка, кроме
@@ -343,8 +354,9 @@ models:
       - name: is_market_vacancy
         description: >
           Вакансия входит в население дашборда рынка: дата-роль
-          (role_type не other), заголовок про данные, одна копия на вакансию
-          (dedup_rank = 1). Грейд, язык, локация и отправка в дайджест не
+          (role_type не other), заголовок про данные, работодатель не из
+          списка микрозадач (is_crowdsourcing_employer), одна копия на
+          вакансию (dedup_rank = 1). Грейд, язык, локация и отправка в дайджест не
           важны — дашборд отвечает «чего хочет рынок», а не «куда я могу
           откликнуться». Снятые вакансии тоже входят: на рынке они были.
         tests:
