@@ -79,7 +79,15 @@ with manfred as (
         -- вычисляется в этом же select, а на его псевдоним окно сослаться
         -- не может. В пределах одного источника source_id — тот же ключ.
         max(ingested_at) over (partition by source_id)
-                                                        as last_seen_at
+                                                        as last_seen_at,
+
+        -- Когда вакансию впервые увидели в списке — замена дате публикации
+        -- для недельной оси дашборда (mart_skill_demand): posted_at у Manfred
+        -- — это updatedAt, бывает многолетней давности. Оговорка: сбор
+        -- Manfred начат 2026-09-20, у офферов старше этой даты first_seen
+        -- — день начала сбора, а не публикации.
+        min(ingested_at) over (partition by source_id)
+                                                        as first_seen_at
 
     from {{ source('raw', 'manfred') }}
 
@@ -92,7 +100,8 @@ select
     location_cities,
     salary_currency,
     salary_period,
-    last_seen_at
+    last_seen_at,
+    first_seen_at
 
 from manfred
 

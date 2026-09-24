@@ -95,6 +95,14 @@ models:
           у Manfred нет.
         tests:
           - not_null
+      - name: first_seen_at
+        description: >
+          Когда вакансию впервые увидели в списке офферов: минимум
+          ingested_at по вакансии. Замена даты публикации для недельной оси
+          дашборда. Сбор начат 2026-09-20 — у более старых офферов это день
+          начала сбора, а не публикации.
+        tests:
+          - not_null
 
   - name: stg_vacancy_pages
     description: >

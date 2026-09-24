@@ -3,25 +3,95 @@ version: 2
 models:
   - name: mart_skill_demand
     description: >
-      Спрос на навыки по неделям. Одна строка = одна неделя × один навык.
-      Считается по упоминанию навыка в тексте вакансии.
+      Спрос на навыки для дашборда. Одна строка = неделя × навык × роль.
+      Население — весь рынок дата-ролей (is_market_vacancy), не подборка.
+      Навыки — из поля stack ответа модели, написания склеены макросом
+      normalize_skill. Строится из mart_vacancies_scored, поэтому это
+      скользящий срез за 30 дней, а не история.
     columns:
+      - name: skill_demand_key
+        description: "Ключ строки: week|skill|role_type."
+        tests:
+          - unique
+          - not_null
       - name: week
+        description: >
+          Неделя с понедельника (isoweek) по дате публикации; у Manfred —
+          по первому появлению в списке (stg_manfred_facts.first_seen_at).
         tests:
           - not_null
       - name: skill
+        description: "Навык из stack после normalize_skill, в нижнем регистре."
+        tests:
+          - not_null
+      - name: role_type
         tests:
           - not_null
       - name: vacancies_count
-        description: "Число уникальных вакансий с этим навыком за неделю."
-        # Пример теста с условием: значение должно быть больше нуля.
-        # Он требует пакет dbt_utils — подключим его на второй неделе через
-        # packages.yml, тогда и раскомментируем. Сейчас строки выключены,
-        # чтобы `dbt build` не падал из-за отсутствующего пакета.
-        # tests:
-        #   - dbt_utils.accepted_range:
-        #       min_value: 1
-        #       inclusive: true
+        description: "Уникальных рыночных вакансий этой роли за неделю, где модель нашла навык."
+        tests:
+          - not_null
+      - name: spain_vacancies_count
+        description: "Из них в Барселоне или Испании (is_barcelona или location_fit = spain)."
+        tests:
+          - not_null
+      - name: remote_vacancies_count
+        description: "Из них полностью удалённых (work_mode = remote или location_fit = remote)."
+        tests:
+          - not_null
+      - name: role_vacancies_count
+        description: >
+          Знаменатель: всех рыночных вакансий этой роли за неделю, со stack и
+          без. Одинаков у всех навыков внутри неделя × роль.
+        tests:
+          - not_null
+      - name: role_vacancies_with_stack
+        description: >
+          Знаменатель для доли навыка: из них вакансий, у которых есть stack.
+          Доля = vacancies_count / role_vacancies_with_stack. Разница с
+          role_vacancies_count — непокрытая моделью часть рынка.
+        tests:
+          - not_null
+
+  - name: mart_salary
+    description: >
+      Зарплатные вилки для дашборда. Одна строка = роль × грейд × город ×
+      период оплаты × валюта. Население — рынок (is_market_vacancy), только
+      вакансии с хотя бы одной границей вилки. Вилка — salary_*_best: поле
+      источника главнее ответа модели. Годовые и месячные суммы к одной
+      шкале не приводятся (в Испании 12 или 14 выплат). null в городе,
+      периоде или валюте — отдельная группа «не указано». Срез за 30 дней.
+    columns:
+      - name: salary_key
+        description: "Ключ строки: роль|грейд|город|период|валюта, null заменён на «(не указан)»."
+        tests:
+          - unique
+          - not_null
+      - name: role_type
+        tests:
+          - not_null
+      - name: seniority
+        description: "Грейд по заголовку (наша регулярка), не ответ модели."
+        tests:
+          - not_null
+      - name: city
+        description: "location_city из mart_vacancies_scored: город источника, иначе модели. null — не указан."
+      - name: salary_period
+        description: "Период оплаты: year / month / day / hour. null — не указан."
+      - name: salary_currency
+        description: "Валюта, ISO 4217. null — не указана."
+      - name: vacancies_count
+        description: "Вакансий с хотя бы одной границей вилки."
+        tests:
+          - not_null
+      - name: salary_min_median
+        description: "Медиана нижней границы — по вакансиям, где она указана. Точная (percentile_cont)."
+      - name: salary_max_median
+        description: "Медиана верхней границы — по вакансиям, где она указана."
+      - name: salary_min_min
+        description: "Самая низкая нижняя граница в группе."
+      - name: salary_max_max
+        description: "Самая высокая верхняя граница в группе."
 
   - name: mart_vacancies_scored
     description: >
@@ -220,11 +290,21 @@ models:
         description: >
           Страница вакансии отдала 404 (stg_vacancy_pages). null — страницу
           не скачивали: у источников, кроме Adzuna, её не бывает вовсе.
+      - name: is_market_vacancy
+        description: >
+          Вакансия входит в население дашборда рынка: дата-роль
+          (role_type не other), заголовок про данные, одна копия на вакансию
+          (dedup_rank = 1). Грейд, язык, локация и отправка в дайджест не
+          важны — дашборд отвечает «чего хочет рынок», а не «куда я могу
+          откликнуться». Снятые вакансии тоже входят: на рынке они были.
+        tests:
+          - not_null
       - name: is_enrichment_candidate
         description: >
-          Прошла правила исключения, проверяемые без модели: грейд, роль,
-          заголовок не про данные, мёртвая страница, дубль. Правила, которые
-          зависят от модели или языка (awaiting_language_check, foreign_language_required,
+          Рыночная вакансия (is_market_vacancy), которая ещё жива (не dead).
+          С 2026-09-24 грейд кандидатов не отсекает: lead и junior нужны
+          дашборду рынка. Правила, которые зависят от модели или языка
+          (awaiting_language_check, foreign_language_required,
           residency_too_long, wrong_location), кандидатов не отсекают.
           По этому флагу fetch/adzuna_pages.py качает страницы.
         tests:

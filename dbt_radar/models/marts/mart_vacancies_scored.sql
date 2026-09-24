@@ -673,7 +673,8 @@ enrichment_rule as (
     --   - зависящие от ответа модели или от языка: awaiting_language_check
     --     (до 2026-09-22 — not_english), foreign_language_required,
     --     residency_too_long, wrong_location.
-    -- Кандидат на обогащение — вакансия, прошедшая правила ПЕРВОГО вида.
+    -- Кандидат на обогащение — вакансия, прошедшая правила ПЕРВОГО вида,
+    -- кроме грейда (с 2026-09-24, см. ниже).
     -- Правила второго вида кандидатов не отсекают: иначе модель никогда не
     -- увидит вакансию, про которую как раз она и должна ответить. Так было
     -- до 2026-09-22 — к модели шла только готовая подборка, и испанские
@@ -703,15 +704,33 @@ enrichment_rule as (
     -- coalesce на is_dead: у вакансии без скачанной страницы он null, а
     -- not null — тоже null, и строка выпала бы из кандидатов. То есть
     -- страницу не скачали бы именно потому, что её ещё не скачали.
+    --
+    -- С 2026-09-24 грейд кандидатов не отсекает. Кроме дайджеста у ответов
+    -- модели есть второй потребитель — дашборд рынка (mart_skill_demand,
+    -- mart_salary), и ему нужна вся масса дата-ролей, включая lead и junior.
+    -- Без модели у них не было бы stack, и дашборд измерял бы наш фильтр,
+    -- а не рынок. Цена — около 70 вакансий разово и 2–3 в день.
     select
         *,
-        seniority not in ('lead', 'junior')
-            and role_type != 'other'
+        role_type != 'other'
             and not is_non_data_title
-            and not coalesce(is_dead, false)
-            and dedup_rank = 1                          as is_enrichment_candidate
+            and dedup_rank = 1                          as is_market_vacancy
 
     from ranked
+
+),
+
+enrichment_candidate as (
+
+    -- Кандидат — рыночная вакансия, которая ещё жива: на снятую тратить
+    -- квоту модели незачем. Отдельный блок, потому что в одном select
+    -- нельзя сослаться на is_market_vacancy, который в нём же и вычисляется.
+    select
+        *,
+        is_market_vacancy
+            and not coalesce(is_dead, false)            as is_enrichment_candidate
+
+    from enrichment_rule
 
 ),
 
@@ -725,7 +744,7 @@ enrichment_ready as (
             and (source != 'adzuna' or description_source = 'page')
                                                         as is_ready_for_enrichment
 
-    from enrichment_rule
+    from enrichment_candidate
 
 )
 
@@ -798,6 +817,7 @@ select
     -- чтобы по витрине было видно, из чего сложился is_enrichment_candidate.
     dedup_rank,
     is_dead,
+    is_market_vacancy,
     is_enrichment_candidate,
     is_ready_for_enrichment,
 
