@@ -212,10 +212,10 @@ facts as (
         -- Барселону, стоящую в списке не первой («Madrid, España,
         -- Barcelona, España»), не теряем: is_barcelona ищет её во всём
         -- поле location.
-        coalesce(
-            src_location_cities[safe_offset(0)],
-            llm_location_city
-        )                                               as location_city,
+        -- normalize_city склеивает написания одного города («Coruña» и
+        -- «A Coruña»), см. macros/normalize_city.sql.
+        {{ normalize_city('coalesce(src_location_cities[safe_offset(0)], llm_location_city)') }}
+                                                        as location_city,
 
         -- Требуемые языки. Не coalesce, а проверка на пустоту: пустой
         -- languages у Manfred значит «компания не указала», а не «язык не

@@ -61,6 +61,10 @@ models:
       источника главнее ответа модели. Годовые и месячные суммы к одной
       шкале не приводятся (в Испании 12 или 14 выплат). null в городе,
       периоде или валюте — отдельная группа «не указано». Срез за 30 дней.
+      ДЛЯ БЫСТРОГО ЧТЕНИЯ ГЛАЗАМИ, НЕ ДЛЯ ДАШБОРДА: медианы этой таблицы
+      нельзя складывать и усреднять — медиана роли не собирается из медиан
+      ячеек роль × город. Для графиков — mart_salary_facts, медиану на
+      нужном уровне считает Looker. Счётчик vacancies_count складывается.
     columns:
       - name: salary_key
         description: "Ключ строки: роль|грейд|город|период|валюта, null заменён на «(не указан)»."
@@ -92,6 +96,52 @@ models:
         description: "Самая низкая нижняя граница в группе."
       - name: salary_max_max
         description: "Самая высокая верхняя граница в группе."
+
+  - name: mart_salary_facts
+    description: >
+      Факты для дашборда зарплат: одна строка = одна рыночная вакансия
+      (is_market_vacancy) хотя бы с одной границей вилки. Без агрегатов —
+      медиану и другие агрегаты на любом уровне считает Looker. Вилка —
+      salary_*_best: поле источника главнее ответа модели. Периоды к одной
+      шкале не приводятся. Срез за 30 дней.
+    columns:
+      - name: vacancy_key
+        tests:
+          - unique
+          - not_null
+      - name: role_type
+        tests:
+          - not_null
+      - name: seniority
+        description: "Грейд по заголовку (наша регулярка), не ответ модели."
+        tests:
+          - not_null
+      - name: city
+        description: "location_city: город источника, иначе модели; написания склеены normalize_city. null — не указан."
+      - name: country
+        description: "Страна по ответу модели, ISO 3166-1 alpha-2. null — не обогащена или страна не указана."
+      - name: work_mode
+        description: "onsite / hybrid / remote / unclear: поле источника (Manfred), иначе модели."
+      - name: source
+        tests:
+          - not_null
+      - name: week
+        description: >
+          Неделя с понедельника (isoweek) по дате публикации; у Manfred — по
+          первому появлению в списке. То же правило, что в mart_skill_demand.
+        tests:
+          - not_null
+      - name: salary_from
+        description: "Нижняя граница вилки. null — указана только верхняя."
+      - name: salary_to
+        description: "Верхняя граница вилки. null — указана только нижняя."
+      - name: salary_period
+        description: "year / month / day / hour. null — не указан."
+      - name: salary_currency
+        description: "ISO 4217. null — не указана."
+      - name: url
+        tests:
+          - not_null
 
   - name: mart_vacancies_scored
     description: >
