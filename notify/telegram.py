@@ -19,6 +19,9 @@
      Временный сбой (429, 5xx, сеть) не пишется: вакансия остаётся в очереди
      и уйдёт в следующий раз. Следующая сборка dbt уберёт из очереди всё
      записанное (stg_digest_sent → mart_digest_queue).
+  4. Печатает, когда истекает raw.digest_sent в песочнице BigQuery, и
+     пересоздаёт её, если осталось меньше RENEW_BEFORE (см. keep_table_alive), —
+     в любой день, даже когда очередь пуста или не доставлено ничего.
 
 Почему лимит, а не вся очередь сразу: очередь копит вакансии за 30 дней, и
 сотня сообщений подряд — уже не подборка, а лента. Лимит откладывает, а не
@@ -62,7 +65,7 @@ import html
 import os
 import re
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -143,6 +146,29 @@ LANGUAGE_LABELS = {
     "pl": "польском",
     "ru": "русском",
 }
+
+# За сколько дней до истечения пересоздавать raw.digest_sent.
+#
+# Проект в песочнице BigQuery: у таблицы без партиций срок жизни — 60 дней от
+# СОЗДАНИЯ, потом она удаляется целиком. Для digest_sent это значило бы:
+# журнал отправок пропал, и бот заново прислал бы всю подборку.
+#
+# Сдвинуть срок нельзя: песочница не даёт поставить больше «создание + 61
+# день» (проверено 2026-09-24, отказ 403 «Table expiration time must be less
+# than 60 days while in sandbox mode»). Работает пересоздание: create or
+# replace из самой себя даёт таблице новую дату создания, а с ней новые 60
+# дней; строки и схема сохраняются, замена атомарна.
+#
+# Пересоздаём не каждый день, а когда осталось меньше RENEW_BEFORE: это
+# единственный журнал отправок, и чем реже его переписывать целиком, тем
+# меньше поводов что-то сломать. 30 дней — половина срока: даже месяц
+# упавших прогонов подряд таблицу не погубит.
+#
+# Почему не партиции, как у остальных raw-таблиц: у них удаляются партиции
+# старше 60 дней, и вакансия Manfred, которая висит в списке дольше, пришла
+# бы повторно — её запись об отправке уже удалена. Почему не биллинг: решено
+# держать проект бесплатным.
+RENEW_BEFORE = timedelta(days=30)
 
 # Схема явная, как в остальных модулях, и та же, что в sql/raw_digest_sent.sql.
 TABLE_SCHEMA = [
@@ -435,6 +461,52 @@ def save_status(bq: bigquery.Client, table_id: str, vacancy_key: str, status: st
     bq.load_table_from_json([row], table_id, job_config=job_config).result()
 
 
+def keep_table_alive(bq: bigquery.Client, table_id: str) -> None:
+    """Печатает срок жизни raw.digest_sent; если осталось меньше RENEW_BEFORE — пересоздаёт её.
+
+    Строка со сроком печатается в каждом прогоне: продление должно быть
+    видно. Если однажды оно тихо перестанет работать, по логу это заметно
+    задолго до удаления таблицы. Ошибку не глотаем: не вышло — прогон
+    падает и задача краснеет, хотя сообщения к этому моменту уже отправлены.
+    """
+    table = bq.get_table(table_id)
+    name = f"{RAW_DATASET}.{TABLE_NAME}"
+    if table.expires is None:
+        # Вне песочницы (подключили биллинг) срока может не быть вовсе.
+        print(f"{name}: срока жизни нет, пересоздавать не нужно", flush=True)
+        return
+
+    left = table.expires - datetime.now(timezone.utc)
+    print(f"{name}: истекает {table.expires:%Y-%m-%d %H:%M} UTC, осталось {left.days} дн.", flush=True)
+    if left >= RENEW_BEFORE:
+        return
+
+    rows_before = table.num_rows
+    # Колонки перечислены явно, с not null: create ... as select без списка
+    # сделал бы все колонки необязательными, и схема разошлась бы с
+    # sql/raw_digest_sent.sql и TABLE_SCHEMA. Меняешь схему там — поменяй и здесь.
+    bq.query(f"""
+        create or replace table `{table_id}` (
+            vacancy_key string not null,
+            sent_at     timestamp not null,
+            status      string
+        ) as
+        select vacancy_key, sent_at, status
+        from `{table_id}`
+    """).result()
+
+    table = bq.get_table(table_id)
+    # Это единственный журнал отправок: потерять из него строку — значит
+    # прислать вакансию повторно. Замена атомарна, и расхождения быть не
+    # должно; если оно всё же есть — падаем громко, а не идём дальше.
+    if table.num_rows != rows_before:
+        raise RuntimeError(
+            f"{name}: после пересоздания строк {table.num_rows}, а было {rows_before}"
+        )
+    print(f"{name}: пересоздана, строк {table.num_rows}, теперь истекает "
+          f"{table.expires:%Y-%m-%d %H:%M} UTC", flush=True)
+
+
 def send_digest(limit: int | None, catch_up: bool) -> None:
     """Отправляет вакансии очереди, записывает исходы и печатает итог.
 
@@ -480,6 +552,9 @@ def send_digest(limit: int | None, catch_up: bool) -> None:
             if problem is not None:
                 raise SystemExit(f"Очередь пуста, и сообщение об этом не ушло: {problem}")
             print("итог: очередь пуста, отправлено сообщение «сегодня новых вакансий нет»", flush=True)
+            # Записей сегодня нет, а следить за сроком всё равно нужно:
+            # иначе несколько тихих недель подряд — и таблицу удалят.
+            keep_table_alive(bq, table_id)
             return
 
         # Шапка — такое же сообщение, как остальные: не ушла — пишем в лог
@@ -551,6 +626,12 @@ def send_digest(limit: int | None, catch_up: bool) -> None:
                 print(f"  недоставляемая: {undeliverable_key} — {reason}", flush=True)
             for failed_key, reason in failed.items():
                 print(f"  сбой: {failed_key} — {reason}", flush=True)
+
+    # После всех записей и до проверки ниже: в день, когда не доставлено
+    # ничего, за сроком тоже надо проследить. Сюда не доходим, только если
+    # прогон упал с исключением, — тогда проверит следующий: пересоздаём
+    # за RENEW_BEFORE до истечения, запас большой.
+    keep_table_alive(bq, table_id)
 
     # Код 1 — только если не доставлена ни одна вакансия: тогда сломано что-то
     # общее (токен, chat id, сеть, разметка), а не отдельное сообщение.

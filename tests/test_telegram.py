@@ -122,6 +122,7 @@ class SendDigestTest(unittest.TestCase):
         self.header_outcomes = ["ok"]                   # ответы на шапку и сообщение пустого дня
         self.sleeps: list[float] = []
         self.saved: list[tuple[str, str]] = []          # что «записано в raw.digest_sent»: (ключ, status)
+        self.kept_alive: list[str] = []                 # таблицы, у которых проверяли срок жизни
         for patcher in [
             mock.patch.dict(os.environ, {
                 "BQ_PROJECT": "fake-project",
@@ -132,6 +133,8 @@ class SendDigestTest(unittest.TestCase):
             mock.patch.object(tg.bigquery, "Client", lambda project: None),
             mock.patch.object(tg, "save_status",
                               lambda bq, table_id, key, status: self.saved.append((key, status))),
+            mock.patch.object(tg, "keep_table_alive",
+                              lambda bq, table_id: self.kept_alive.append(table_id)),
             mock.patch.object(tg.time, "sleep", self.sleeps.append),
         ]:
             patcher.start()
@@ -458,6 +461,86 @@ class SendDigestTest(unittest.TestCase):
         self.assertEqual(self.saved, [])
         self.assertIsInstance(exit_message, str, log)
         self.assertIn("доставлено 0, недоставляемых 0, сбоев 2; шапка не доставлена; осталось в очереди 2", log)
+
+    # --- срок жизни raw.digest_sent ---
+
+    def test_table_kept_alive_every_run(self) -> None:
+        """Срок проверяется в обычный день, в пустой и в день, когда не доставлено ничего."""
+        table_id = "fake-project.raw.digest_sent"
+
+        self.run_send([make_vacancy("ok")])
+        self.assertEqual(self.kept_alive, [table_id])
+
+        self.run_send([])
+        self.assertEqual(self.kept_alive, [table_id] * 2)
+
+        # Ничего не доставлено — прогон кончается кодом 1, но проверить срок успевает.
+        _, exit_message = self.run_send([make_vacancy("403")])
+        self.assertIsInstance(exit_message, str)
+        self.assertEqual(self.kept_alive, [table_id] * 3)
+
+
+class FakeTable:
+    """Таблица BigQuery: только те поля, что читает keep_table_alive."""
+
+    def __init__(self, expires, num_rows: int) -> None:
+        self.expires = expires
+        self.num_rows = num_rows
+
+
+class FakeBigQuery:
+    """BigQuery с одной таблицей. create or replace даёт ей новый срок — 60 дней от сейчас."""
+
+    def __init__(self, days_left: float, num_rows: int = 231, rows_after_replace: int | None = None) -> None:
+        now = tg.datetime.now(tg.timezone.utc)
+        self.table = FakeTable(now + tg.timedelta(days=days_left), num_rows)
+        self.rows_after_replace = num_rows if rows_after_replace is None else rows_after_replace
+        self.queries: list[str] = []
+
+    def get_table(self, table_id: str) -> FakeTable:
+        return self.table
+
+    def query(self, sql: str):
+        self.queries.append(sql)
+        now = tg.datetime.now(tg.timezone.utc)
+        self.table = FakeTable(now + tg.timedelta(days=60), self.rows_after_replace)
+        return mock.Mock()      # у настоящего ответа вызывают .result()
+
+
+class KeepTableAliveTest(unittest.TestCase):
+
+    def run_keep_alive(self, bq: FakeBigQuery) -> str:
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            tg.keep_table_alive(bq, "fake-project.raw.digest_sent")
+        return log.getvalue()
+
+    def test_far_from_expiry_only_logs(self) -> None:
+        """До истечения больше RENEW_BEFORE: только строка со сроком, таблицу не трогаем."""
+        bq = FakeBigQuery(days_left=45)
+        log = self.run_keep_alive(bq)
+
+        self.assertEqual(bq.queries, [])
+        self.assertRegex(log, r"raw\.digest_sent: истекает \d{4}-\d\d-\d\d \d\d:\d\d UTC, осталось 4[45] дн\.")
+        self.assertNotIn("пересоздана", log)
+
+    def test_near_expiry_recreates_and_logs_new_date(self) -> None:
+        """Осталось меньше RENEW_BEFORE: create or replace из самой себя с not null, новая дата в логе."""
+        bq = FakeBigQuery(days_left=10)
+        log = self.run_keep_alive(bq)
+
+        (sql,) = bq.queries
+        self.assertIn("create or replace table `fake-project.raw.digest_sent`", sql)
+        self.assertIn("vacancy_key string not null", sql)
+        self.assertIn("sent_at     timestamp not null", sql)
+        self.assertIn("from `fake-project.raw.digest_sent`", sql)
+        self.assertRegex(log, r"пересоздана, строк 231, теперь истекает \d{4}-\d\d-\d\d \d\d:\d\d UTC")
+
+    def test_lost_rows_fail_loudly(self) -> None:
+        """После пересоздания строк меньше, чем было, — падаем, а не идём дальше."""
+        bq = FakeBigQuery(days_left=10, num_rows=231, rows_after_replace=230)
+        with self.assertRaisesRegex(RuntimeError, "строк 230, а было 231"):
+            self.run_keep_alive(bq)
 
 
 if __name__ == "__main__":
