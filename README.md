@@ -79,10 +79,11 @@ A Careerjet collector exists and is tested, but sits unscheduled: their publishe
 | lead or junior | 2 812 |
 | not Barcelona and not fully remote | 141 |
 | posting removed by the source | 57 |
-| requires a language other than English | 55 |
+| requires a language other than English or Russian | 55 |
 | language not checked yet — held, not dropped | 6 |
 | requires residence in a named other country | 5 |
 | sales role matched by a data keyword | 4 |
+| requires more than a year of residence | 1 |
 | **passes everything** | **85** |
 
 ---
