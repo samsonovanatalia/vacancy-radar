@@ -14,7 +14,7 @@ Every morning a GitHub Actions workflow collects postings from four sources and 
 
 At 10:00 a bot sends the queue to Telegram — only postings never sent before, and only ones confirmed alive.
 
-**16 393 distinct postings collected in 25 days, 448 of them data roles, 95 currently pass every filter, 232 delivered.** Collection ran on 24 of those 25 days.
+**16 393 distinct postings collected in 25 days; 232 delivered.** Of the 16 249 in the current 30-day window, 448 are distinct data-role postings and 95 currently pass every filter. Collection ran on 24 of those 25 days.
 
 The interesting problems here were not "how do I call an API". They were: *this field looks filled, but is it true*, *this number looks fine, but what am I comparing it to*, and *this filter works, but is it filtering the thing I meant*.
 
@@ -63,13 +63,15 @@ Rules that appear twice tend to drift apart, so shared logic lives in macros (`c
 
 ## Sources
 
-| Source | Collected | Distinct | Data roles | Passing every filter | Yield |
-|---|---|---|---|---|---|
-| Arbeitnow | 15 450 | 11 405 | 155 | 19 | 0.2% |
-| Adzuna | 12 807 | 4 614 | 243 | 41 | 0.9% |
-| **Manfred** | 240 | **60** | 50 | **35** | **58%** |
-| RemoteOK | 2 082 | 297 | 0 | 0 | — |
-| Remotive | 34 | 17 | 0 | 0 | **disabled** |
+| Source | Collected | Distinct | In 30-day window | Data roles | Passing every filter | Yield |
+|---|---|---|---|---|---|---|
+| Arbeitnow | 15 450 | 11 405 | 11 405 | 155 | 19 | 0.2% |
+| Adzuna | 12 807 | 4 614 | 4 614 | 243 | 41 | 0.9% |
+| **Manfred** | 240 | **60** | 60 | 50 | **35** | **58%** |
+| RemoteOK | 2 082 | 297 | 164 | 0 | 0 | — |
+| Remotive | 34 | 17 | 6 | 0 | 0 | **disabled** |
+
+*Collected* is every row in `raw`, *Distinct* every posting ever seen — both all-time. The remaining columns are the current 30-day window: data roles are distinct postings after deduplication, and yield is passing ÷ in window.
 
 Sources are connected, measured, and kept or dropped on the share of postings that actually survive filtering — not on how many rows they produce. Arbeitnow supplies two thirds of the warehouse and one fifth of the shortlist. Manfred supplies 0.4% of the warehouse and more than a third of the shortlist, because it covers exactly one market (Spanish tech) and states salary, working language and remote share as structured fields.
 
@@ -113,7 +115,7 @@ The full log lives in [`decisions.md`](decisions.md). The ones worth reading:
 
 **The filter measured a stand-in for what I actually wanted.** The rule excluded postings *written* in a language other than English. What I needed was postings where the *work* requires one. These correlate well enough to look right — and the rule was discarding thousands of postings on that basis. Measured against Manfred, which states the working language as a structured field: Spanish is genuinely required by 6 postings out of 60, while the old rule excluded 56. The fix reads the requirement instead of the prose; non-English ads now arrive labelled as such.
 
-**One rule was quietly doing another rule's job.** There was no location rule at all — geography lived only in the score. German postings were being excluded for being written in German, not for being in Berlin, and the coincidence held the digest together. Removing the language filter would have flooded it. The explicit rule ("Barcelona, or fully remote") now removes 164 postings that had been arriving all along, mostly from London, Madrid and Berlin.
+**One rule was quietly doing another rule's job.** There was no location rule at all — geography lived only in the score. German postings were being excluded for being written in German, not for being in Berlin, and the coincidence held the digest together. Removing the language filter would have flooded it. The explicit rule ("Barcelona, or fully remote") now removes 164 postings that had been arriving all along — 98 of them from Madrid (36), London (35) and Berlin (27).
 
 **The API was lying by omission.** Enrichment produced almost nothing useful for a week, and the prompt kept getting blamed. Measuring the *inputs* instead of the outputs found the cause: Adzuna truncates every description at exactly 500 characters — min 468, median 500, max 500. The fix was not a better prompt but a fetch step pulling full text from the posting page: 10–17× more text, and a stack extracted for 9 of 9 postings that had one, against 0 of 7 before.
 
