@@ -28,11 +28,12 @@ models:
           mart_vacancies_for_me; тот же период 30 дней (у Manfred — 2 дня).
         tests:
           - not_null
-      - name: with_salary
+      - name: with_salary_eur_year
         description: >
-          Из market_vacancies те, где указана хотя бы одна граница вилки
-          (salary_min_best или salary_max_best — из источника, иначе из
-          ответа модели); тот же период 30 дней (у Manfred — 2 дня).
+          Рыночные вакансии за окно, у которых указана вилка в евро за год.
+          Населения с другими валютами и периодами в это число не входят.
+          Вилка указана — есть хотя бы одна граница (salary_min_best или
+          salary_max_best); окно — 30 дней (у Manfred — 2 дня).
         tests:
           - not_null
       - name: sources_active

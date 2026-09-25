@@ -27,10 +27,17 @@ with scored as (
         countif(excluded_reason is null)                as matching_vacancies,
         -- Вилка указана, если есть хотя бы одна граница: так же считает
         -- mart_salary. _best — поле источника, а если его нет — ответ модели.
+        -- Только евро за год — то же население, что таблица зарплат на
+        -- дашборде (mart_salary_facts с фильтрами EUR и year). Без этого
+        -- сводка считала и GBP, и месячные вилки, и два числа не сходились.
+        -- Значения в верхнем и нижнем регистре, как их пишет
+        -- mart_vacancies_scored: валюта — ISO 4217, период — строчными.
         countif(
             is_market_vacancy
             and (salary_min_best is not null or salary_max_best is not null)
-        )                                               as with_salary
+            and salary_currency_best = 'EUR'
+            and salary_period_best = 'year'
+        )                                               as with_salary_eur_year
     from {{ ref('mart_vacancies_scored') }}
 
 ),
@@ -62,7 +69,7 @@ select
     scored.vacancies_fresh,
     scored.market_vacancies,
     scored.matching_vacancies,
-    scored.with_salary,
+    scored.with_salary_eur_year,
     sources.sources_active,
     sent.sent_total
 from scored
