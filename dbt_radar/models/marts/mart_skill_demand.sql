@@ -81,6 +81,23 @@ skills as (
     cross join unnest(market.stack) as skill_raw
     where trim(skill_raw) != ''
 
+),
+
+skill_ranks as (
+
+    -- Место навыка по всему окну сразу: все недели и роли вместе. Нужно
+    -- дашборду — в Looker Studio фильтр skill_rank <= 20 отрезает длинный
+    -- хвост редких навыков, а ограничить число столбцов там неудобно.
+    -- count(distinct) по той же причине, что и ниже: склеенные написания.
+    -- rank(), а не row_number(): у навыков с равным числом вакансий одно
+    -- место, поэтому на границе фильтр может пропустить чуть больше 20
+    -- навыков — зато не отрежет один из двух равных наугад.
+    select
+        skill,
+        rank() over (order by count(distinct vacancy_key) desc) as skill_rank
+    from skills
+    group by skill
+
 )
 
 select
@@ -101,8 +118,11 @@ select
                                                         as remote_vacancies_count,
     -- any_value: внутри группы неделя × роль знаменатель один и тот же.
     any_value(role_week.role_vacancies_count)           as role_vacancies_count,
-    any_value(role_week.role_vacancies_with_stack)      as role_vacancies_with_stack
+    any_value(role_week.role_vacancies_with_stack)      as role_vacancies_with_stack,
+    -- any_value: у навыка одно место на всё окно, во всех его строках.
+    any_value(skill_ranks.skill_rank)                   as skill_rank
 
 from skills
 join role_week using (week, role_type)
+join skill_ranks using (skill)
 group by skills.week, skills.skill, skills.role_type
