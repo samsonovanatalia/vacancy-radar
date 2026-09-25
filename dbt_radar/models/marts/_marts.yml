@@ -1,6 +1,53 @@
 version: 2
 
 models:
+  - name: mart_dashboard_kpi
+    description: >
+      Сводка для дашборда: ровно одна строка, каждая метрика — колонка.
+      Периоды у колонок разные — указаны в описании каждой. Что строка одна,
+      проверяет тест tests/assert_mart_dashboard_kpi_one_row.sql.
+    columns:
+      - name: vacancies_fresh
+        description: >
+          Все строки mart_vacancies_scored, включая дубли и не дата-роли:
+          вакансии, опубликованные за последние 30 дней (у Manfred —
+          замеченные в списке за последние 2 дня).
+        tests:
+          - not_null
+      - name: market_vacancies
+        description: >
+          Из vacancies_fresh рыночные (is_market_vacancy) — дата-роль, не
+          продажи и не найм по заголовку, не микрозадачи для обучения ИИ, без
+          дублей; тот же период 30 дней (у Manfred — 2 дня).
+        tests:
+          - not_null
+      - name: matching_vacancies
+        description: >
+          Из vacancies_fresh те, что не исключило ни одно правило
+          подборки (excluded_reason is null) — то, что попадает в
+          mart_vacancies_for_me; тот же период 30 дней (у Manfred — 2 дня).
+        tests:
+          - not_null
+      - name: with_salary
+        description: >
+          Из market_vacancies те, где указана хотя бы одна граница вилки
+          (salary_min_best или salary_max_best — из источника, иначе из
+          ответа модели); тот же период 30 дней (у Manfred — 2 дня).
+        tests:
+          - not_null
+      - name: sources_active
+        description: >
+          Число источников, из которых пришла хотя бы одна вакансия за
+          последние 7 дней по дате сбора (stg_vacancies.ingested_at).
+        tests:
+          - not_null
+      - name: sent_total
+        description: >
+          Число вакансий, доставленных ботом в Telegram (status = sent в
+          stg_digest_sent), за всё время работы бота.
+        tests:
+          - not_null
+
   - name: mart_skill_demand
     description: >
       Спрос на навыки для дашборда. Одна строка = неделя × навык × роль.
