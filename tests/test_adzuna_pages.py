@@ -2,7 +2,8 @@
 
 Ни сеть, ни BigQuery тесты не вызывают. HTTP-клиент httpx настоящий, но его
 транспорт подменён на httpx.MockTransport: ответ выбирается по source_id в
-адресе страницы. Паузы подменены и по-настоящему не ждут.
+адресе страницы. Паузы подменены и по-настоящему не ждут. Часы
+(time.monotonic) тоже поддельные: их двигают только подменённые паузы.
 
 Запрос кандидатов (SQL) здесь не проверяется — он подменён готовым списком.
 
@@ -16,6 +17,7 @@ import contextlib
 import io
 import json
 import os
+import signal
 import unittest
 from unittest import mock
 
@@ -72,13 +74,15 @@ class FetchAdzunaPagesTest(unittest.TestCase):
         self.user_agents: set[str] = set()
         self.sleeps: list[float] = []
         self.saved_rows: list[dict] = []
+        self.clock = 0.0                              # поддельное time.monotonic
         for patcher in [
             mock.patch.dict(os.environ, {"BQ_PROJECT": "fake-project"}),
             mock.patch.object(fp.httpx, "Client", self.client_with_mock_transport),
             mock.patch.object(fp.bigquery, "Client", lambda project: None),
             mock.patch.object(fp, "ensure_table", lambda bq, table_id: None),
             mock.patch.object(fp, "save", lambda bq, table_id, rows: self.saved_rows.extend(rows)),
-            mock.patch.object(fp.time, "sleep", self.sleeps.append),
+            mock.patch.object(fp.time, "sleep", self.fake_sleep),
+            mock.patch.object(fp.time, "monotonic", lambda: self.clock),
         ]:
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -88,6 +92,11 @@ class FetchAdzunaPagesTest(unittest.TestCase):
     def client_with_mock_transport(self, **kwargs) -> httpx.Client:
         """httpx.Client, у которого вместо сети — handle_request."""
         return REAL_HTTPX_CLIENT(transport=httpx.MockTransport(self.handle_request), **kwargs)
+
+    def fake_sleep(self, seconds: float) -> None:
+        """Пауза не ждёт, а запоминается и сдвигает поддельные часы."""
+        self.sleeps.append(seconds)
+        self.clock += seconds
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         """Отвечает по source_id из адреса /details/<source_id>."""
@@ -99,8 +108,14 @@ class FetchAdzunaPagesTest(unittest.TestCase):
         attempt = self.requests_by_id.get(source_id, 0)
         self.requests_by_id[source_id] = attempt + 1
 
-        if source_id == "live":
+        # live и live-1, live-2...: несколько одинаковых живых страниц.
+        if source_id == "live" or source_id.startswith("live-"):
             return httpx.Response(200, html=page(VISIBLE_DESCRIPTION, head=job_posting_ld()))
+        if source_id == "sigterm":
+            # Сигнал посреди запроса страницы. Настоящий os.kill на Windows
+            # убил бы процесс вместе с тестами — вызываем обработчик, который
+            # поставил fetch_pages, как это сделал бы сам Python.
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
         if source_id == "live_graph":
             graph = {"@context": "https://schema.org", "@graph": [
                 {"@type": "Organization", "name": "Adzuna"},
@@ -328,6 +343,41 @@ class FetchAdzunaPagesTest(unittest.TestCase):
         self.assertIn("JSON-LD не разбирается", row["fetch_error"])
         # Страница всё же скачалась — аварии нет.
         self.assertIsNone(exit_message, log)
+
+    # --- обрыв прогона ---
+
+    def test_deadline_stops_run_and_saves_unfinished_batch(self) -> None:
+        """Вакансию, которая может не успеть до дедлайна, не начинаем; пачку дописываем.
+
+        Дедлайн — худшая длительность вакансии плюс 7 поддельных секунд,
+        каждая страница двигает часы на PAUSE_SECONDS (3 с). Перед третьей
+        часы показывают 6 — влезает, перед четвёртой 9 — стоп. Три строки
+        меньше BATCH_SIZE: их дописывает finally.
+        """
+        candidates = [make_candidate(f"live-{i}") for i in range(5)]
+        with mock.patch.object(fp, "RUN_DEADLINE_SECONDS", fp.VACANCY_WORST_SECONDS + 7):
+            log, exit_message = self.run_fetch(candidates)
+
+        self.assertIn("прогон остановлен по дедлайну", log)
+        self.assertIn("не обработано вакансий: 2", log)
+        self.assertEqual([r["source_id"] for r in self.saved_rows], ["live-0", "live-1", "live-2"])
+        self.assertEqual(len(self.requested_urls), 3)
+        self.assertIsNone(exit_message, log)
+        self.assertIn("записано строк 3", log)
+
+    def test_sigterm_saves_unfinished_batch(self) -> None:
+        """SIGTERM посреди запроса: готовые строки дописаны, итог напечатан, код 1."""
+        original = signal.getsignal(signal.SIGTERM)
+        candidates = [make_candidate(s) for s in ["live-1", "removed", "sigterm", "live-2"]]
+        log, exit_message = self.run_fetch(candidates)
+
+        self.assertIsInstance(exit_message, str, log)
+        self.assertIn("SIGTERM", exit_message)
+        self.assertEqual([r["source_id"] for r in self.saved_rows], ["live-1", "removed"])
+        self.assertNotIn("live-2", self.requests_by_id)
+        self.assertIn("записано строк 2", log)
+        # Обработчик вернулся на место: снаружи fetch_pages SIGTERM работает как обычно.
+        self.assertIs(signal.getsignal(signal.SIGTERM), original)
 
 
 if __name__ == "__main__":

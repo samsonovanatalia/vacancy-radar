@@ -126,15 +126,29 @@ BREAKER_MAX_FAILURES = BREAKER_WINDOW // 2
 #
 # Зачем свой, если есть таймаут шага. Таймаут шага — внешний: GitHub убивает
 # процесс, finally не успевает, и пропадает неполная пачка ответов. Так
-# 13.10.2026 потерялись два готовых ответа. Свой дедлайн проверяется перед
-# каждой вакансией, и по нему скрипт выходит сам: дописывает пачку, печатает
-# итог.
+# 13.10.2026 потерялись два готовых ответа. По своему дедлайну скрипт
+# выходит сам: дописывает пачку, печатает итог.
 #
-# Почему 5 минут. Проверка стоит между вакансиями, поэтому начатая вакансия
-# доработает до конца. Худший случай: 3 попытки по REQUEST_TIMEOUT_MS (60 с)
-# плюс паузы 20 и 40 с и PAUSE_SECONDS — около 4 минут, и ещё секунды на
-# запись пачки. Пять минут это покрывают.
+# Проверка — не «время вышло», а «успею ли»: вакансию не начинаем, если
+# в худшем случае (VACANCY_WORST_SECONDS) она закончится позже дедлайна.
+# Так к дедлайну скрипт уже закончил, а не начинает последнюю вакансию.
+# 5 минут до таймаута шага остаются на то, чего часы скрипта не видят:
+# запуск Python и импорты, запись последней пачки, итог.
 RUN_DEADLINE_SECONDS = 25 * 60
+
+# Худшая длительность одной вакансии в секундах: все RETRY_ATTEMPTS попыток
+# упёрлись в таймаут, между ними паузы 20 и 40 с, после — PAUSE_SECONDS.
+# При нынешних числах 3 × 60 + 20 + 40 + 5 = 245 с. Считается из констант,
+# а не записано числом: поменяешь таймаут или число попыток — оценка
+# поменяется сама.
+#
+# Не учтено: 429 с retryDelay длиннее своей паузы. Поминутный лимит просит
+# ждать не больше минуты, и это перекрывают 5 минут запаса.
+VACANCY_WORST_SECONDS = (
+    RETRY_ATTEMPTS * REQUEST_TIMEOUT_MS / 1000
+    + sum(RETRY_BASE_SECONDS * 2 ** i for i in range(RETRY_ATTEMPTS - 1))
+    + PAUSE_SECONDS
+)
 
 # Допустимые значения --source. Тот же список, что в accepted_values колонки
 # source в dbt_radar/models/staging/_staging.yml: появится источник — дописать
@@ -769,6 +783,11 @@ def save(bq: bigquery.Client, table_id: str, rows: list[dict]) -> None:
 
 def enrich(limit: int, source: str | None) -> None:
     """Обогащает до limit кандидатов (только из source, если он задан) и печатает итог."""
+    # Часы дедлайна запускаем в самом начале: поиск кандидатов в BigQuery
+    # тоже съедает время шага. monotonic, а не datetime.now: эти часы не
+    # прыгают, если системное время переведут посреди прогона.
+    deadline = time.monotonic() + RUN_DEADLINE_SECONDS
+
     api_key = read_api_key()
     project = os.environ["BQ_PROJECT"]        # упадёт с понятной ошибкой, если не задан
 
@@ -815,9 +834,6 @@ def enrich(limit: int, source: str | None) -> None:
     # сбой. deque с maxlen сам выбрасывает самый старый исход, когда
     # приходит новый, а sum считает True за 1.
     recent_failures: deque[bool] = deque(maxlen=BREAKER_WINDOW)
-    # monotonic, а не datetime.now: эти часы не прыгают, если системное
-    # время переведут посреди прогона.
-    deadline = time.monotonic() + RUN_DEADLINE_SECONDS
     # signal.signal возвращает прежний обработчик — в finally вернём его на
     # место: снаружи enrich (в тестах, например) SIGTERM работает как обычно.
     previous_sigterm = signal.signal(signal.SIGTERM, stop_on_sigterm)
@@ -836,7 +852,8 @@ def enrich(limit: int, source: str | None) -> None:
     #     вакансия упрётся в неё же до завтра;
     #   предохранитель — больше половины сбоев за последние BREAKER_WINDOW
     #     вакансий: сломано что-то общее, и оставшиеся вакансии упадут так же;
-    #   дедлайн — прошло RUN_DEADLINE_SECONDS, скоро GitHub убьёт шаг;
+    #   дедлайн — следующая вакансия может не успеть до RUN_DEADLINE_SECONDS,
+    #     а после него скоро GitHub убьёт шаг;
     #   Terminated — пришёл SIGTERM: процесс просят завершиться.
     # Ошибки в нашем коде (KeyError, TypeError) сбоем вакансии не считаются
     # и роняют прогон: это баг, и его надо увидеть сразу.
@@ -847,10 +864,12 @@ def enrich(limit: int, source: str | None) -> None:
     # его перехватить нельзя; от него и страхует дедлайн.
     try:
         for number, vacancy in enumerate(candidates, start=1):
-            if time.monotonic() >= deadline:
+            seconds_left = deadline - time.monotonic()
+            if seconds_left < VACANCY_WORST_SECONDS:
                 print(
-                    f"прогон остановлен по дедлайну: прошло {RUN_DEADLINE_SECONDS // 60} "
-                    f"минут; не обработано вакансий: {len(candidates) - number + 1}.",
+                    f"прогон остановлен по дедлайну: до него {seconds_left:.0f} с, а "
+                    f"вакансия в худшем случае занимает {VACANCY_WORST_SECONDS:.0f} с; "
+                    f"не обработано вакансий: {len(candidates) - number + 1}.",
                     flush=True,
                 )
                 break

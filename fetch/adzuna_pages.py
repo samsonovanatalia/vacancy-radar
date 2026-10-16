@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
@@ -93,6 +94,27 @@ SKIP_REASON = "не запрашивали: путь /land/ad/ запрещён 
 # enrich/with_gemini.py.
 MAX_PER_RUN = 60
 
+# Собственный дедлайн прогона в секундах — на 5 минут раньше таймаута шага
+# в collect.yml (timeout-minutes: 20). Меняешь одно — поменяй и другое.
+# Устроен так же, как в enrich/with_gemini.py (там — подробнее, зачем):
+# таймаут шага убивает процесс снаружи, и неполная пачка пропадает, а по
+# своему дедлайну скрипт выходит сам и пачку дописывает. Вакансию не
+# начинаем, если в худшем случае она не успеет закончиться до дедлайна.
+RUN_DEADLINE_SECONDS = 15 * 60
+
+# Худшая длительность одной вакансии в секундах: все попытки упёрлись в
+# таймаут, между ними паузы RETRY_PAUSES, после — PAUSE_SECONDS. При
+# нынешних числах 4 × 30 + 5 + 15 + 45 + 3 = 188 с.
+#
+# Оценка приблизительная: httpx считает таймаут отдельно на соединение и на
+# чтение, а при редиректе — на каждый переход. Расхождение покрывают
+# 5 минут между дедлайном и таймаутом шага.
+VACANCY_WORST_SECONDS = (
+    (len(RETRY_PAUSES) + 1) * REQUEST_TIMEOUT_SECONDS
+    + sum(RETRY_PAUSES)
+    + PAUSE_SECONDS
+)
+
 # Через сколько дней окончательный ответ устаревает и вакансию проверяем
 # снова. Живость — не навсегда: вакансию, однажды ответившую 200, могут
 # снять на следующий день, а без повторной проверки она так и числилась бы
@@ -135,6 +157,24 @@ TABLE_SCHEMA = [
     # null — попытка прошла штатно, каким бы ни был код ответа.
     bigquery.SchemaField("fetch_error", "STRING"),
 ]
+
+
+class Terminated(BaseException):
+    """Процесс получил SIGTERM. Останавливаем прогон, готовое дописываем.
+
+    Тот же приём, что в enrich/with_gemini.py. BaseException — чтобы чужой
+    `except Exception` внутри httpx не проглотил сигнал посреди запроса.
+    """
+
+
+def stop_on_sigterm(signum, frame) -> None:
+    """Обработчик SIGTERM: превращает сигнал в исключение Terminated.
+
+    Исключение уходит вверх, и finally в fetch_pages дописывает пачку.
+    Повторный SIGTERM, пока пачка пишется, игнорируем.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise Terminated()
 
 
 def read_args() -> argparse.Namespace:
@@ -347,6 +387,8 @@ def save(bq: bigquery.Client, table_id: str, rows: list[dict]) -> None:
 
 def fetch_pages(limit: int) -> None:
     """Скачивает страницы до limit кандидатов, пишет строки и печатает итог."""
+    # Часы дедлайна — с самого начала: поиск кандидатов тоже съедает время шага.
+    deadline = time.monotonic() + RUN_DEADLINE_SECONDS
     project = os.environ["BQ_PROJECT"]        # упадёт с понятной ошибкой, если не задан
     bq = bigquery.Client(project=project)
     table_id = f"{project}.{RAW_DATASET}.{TABLE_NAME}"
@@ -364,9 +406,16 @@ def fetch_pages(limit: int) -> None:
     statuses: dict[str, int] = {}     # код ответа → сколько раз
     skipped: dict[str, str] = {}      # vacancy_key → причина пропуска
     failed: dict[str, str] = {}       # vacancy_key → причина сбоя
+    # Прежний обработчик SIGTERM вернём на место в finally.
+    previous_sigterm = signal.signal(signal.SIGTERM, stop_on_sigterm)
 
     # Сбой на одной странице не прерывает прогон: строка с fetch_error
     # пишется, как любая другая, и скрипт идёт к следующей вакансии.
+    #
+    # Прогон останавливают дедлайн (следующая вакансия может не успеть до
+    # RUN_DEADLINE_SECONDS) и SIGTERM. При обоих, как и при падении, finally
+    # дописывает неполную пачку. Необработанные вакансии остаются
+    # кандидатами на следующий прогон.
     #
     # follow_redirects: страница может прийти через редирект, и нам нужны
     # код и адрес конечной страницы. Без него httpx вернул бы сам ответ 30x.
@@ -377,6 +426,16 @@ def fetch_pages(limit: int) -> None:
     ) as client:
         try:
             for number, vacancy in enumerate(candidates, start=1):
+                seconds_left = deadline - time.monotonic()
+                if seconds_left < VACANCY_WORST_SECONDS:
+                    print(
+                        f"прогон остановлен по дедлайну: до него {seconds_left:.0f} с, а "
+                        f"вакансия в худшем случае занимает {VACANCY_WORST_SECONDS} с; "
+                        f"не обработано вакансий: {len(candidates) - number + 1}.",
+                        flush=True,
+                    )
+                    break
+
                 key = vacancy["vacancy_key"]
                 url = vacancy["url"]
                 progress = f"{number}/{len(candidates)} {key}"
@@ -428,6 +487,12 @@ def fetch_pages(limit: int) -> None:
                     save(bq, table_id, rows)
                     written += len(rows)
                     rows = []
+        except Terminated as stop:
+            # Код 1: прогон прерван снаружи и до конца не дошёл.
+            raise SystemExit(
+                "Прогон прерван сигналом SIGTERM. Готовые строки дописаны; "
+                "необработанные вакансии останутся кандидатами на следующий прогон."
+            ) from stop
         finally:
             # finally дописывает неполную порцию и печатает итог даже при падении.
             if rows:
@@ -444,6 +509,7 @@ def fetch_pages(limit: int) -> None:
                 print(f"  пропуск: {skipped_key} — {reason}", flush=True)
             for failed_key, reason in failed.items():
                 print(f"  сбой: {failed_key} — {reason}", flush=True)
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
     # Код 1 — авария: страницы запрашивали, а не скачалась ни одна (нет ни
     # одного ответа 200 или 404). Главный случай — все запросы получили 403:

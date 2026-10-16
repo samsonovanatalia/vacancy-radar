@@ -300,15 +300,17 @@ class EnrichResilienceTest(unittest.TestCase):
         self.assertIn(f"итог: обогащено {eg.BREAKER_WINDOW}, пропущено {2 * half}", log)
 
     def test_deadline_stops_run_and_saves_unfinished_batch(self) -> None:
-        """По дедлайну прогон выходит сам и дописывает неполную пачку.
+        """Вакансию, которая может не успеть до дедлайна, не начинаем; пачку дописываем.
 
-        Дедлайн — 12 поддельных секунд, каждая вакансия двигает часы на
-        PAUSE_SECONDS (5 с). Перед третьей часы показывают 10 — ещё можно,
-        перед четвёртой 15 — стоп. Три готовых ответа меньше BATCH_SIZE, то
-        есть лежат в незаписанной пачке: их должен дописать finally.
+        Дедлайн — худшая длительность вакансии плюс 12 поддельных секунд,
+        каждая вакансия двигает часы на PAUSE_SECONDS (5 с). Перед третьей
+        часы показывают 10: 10 + худшая ≤ дедлайна — начинаем. Перед
+        четвёртой 15: худшая уже не влезает — стоп, хотя дедлайн ещё не
+        наступил. Три готовых ответа меньше BATCH_SIZE, то есть лежат в
+        незаписанной пачке: их должен дописать finally.
         """
         titles = [f"ok#{i}" for i in range(6)]
-        with mock.patch.object(eg, "RUN_DEADLINE_SECONDS", 12):
+        with mock.patch.object(eg, "RUN_DEADLINE_SECONDS", eg.VACANCY_WORST_SECONDS + 12):
             log, exit_message = self.run_enrich(titles)
 
         self.assertIn("прогон остановлен по дедлайну", log)

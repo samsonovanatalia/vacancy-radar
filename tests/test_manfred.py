@@ -349,6 +349,20 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(len(saved), 4)
         self.assertEqual(len(rows), 4)
 
+    def test_unexpected_error_saves_unfinished_batch(self) -> None:
+        """Исключение не из QueryFailed роняет прогон, но остаток пачки записан."""
+        def card(url):
+            # Не словарь: normalize упадёт на нём с ошибкой в нашем коде.
+            return FakeResponse(200, ["не карточка"]) if "/103" in url else FakeResponse(200, CARD)
+
+        with mock.patch.object(mf, "BATCH_SIZE", 2):
+            with self.assertRaises(Exception):
+                self.run_collect(self.offers(5), card)
+        # 100 и 101 — полная пачка, записана в цикле; 102 — остаток, его пишет finally.
+        saved = [json.loads(line)["source_id"] for line in
+                 self.path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(saved, ["100", "101", "102"])
+
     def test_limit(self) -> None:
         rows, totals, _ = self.run_collect(
             self.offers(5), lambda url: FakeResponse(200, CARD), limit=2)

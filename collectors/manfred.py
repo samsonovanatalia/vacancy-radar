@@ -364,33 +364,38 @@ def collect(limit: int | None = None,
     batch: list[dict] = []
     failed: dict[str, str] = {}
 
-    for number, offer in enumerate(candidates, start=1):
-        title = (offer.get("position") or "").strip()
-        # Сбой на одной карточке не должен стоить остальных: запоминаем
-        # и идём дальше. Провал или нет — решаем в конце, когда видно,
-        # удалось ли хоть что-то.
-        try:
-            card = fetch_json(DETAIL_URL.format(offer_id=offer["id"]),
-                              f"карточка {offer['id']}")
-        except QueryFailed as problem:
-            failed[str(offer["id"])] = str(problem)
-            print(f"  {number}/{len(candidates)} {title[:40]}: "
-                  f"карточка не получена — {problem}", flush=True)
-        else:
-            row = normalize(offer, card)
-            batch.append(row)
-            collected.append(row)
-            print(f"  {number}/{len(candidates)} {title[:40]}: "
-                  f"текст {len(row['description'] or '')} символов", flush=True)
+    # finally дописывает остаток пачки при любом выходе из цикла, в том
+    # числе при исключении не из QueryFailed — например, KeyError в
+    # normalize на неожиданной карточке. Раньше остаток писался после
+    # цикла, и такое исключение теряло до BATCH_SIZE − 1 собранных строк.
+    try:
+        for number, offer in enumerate(candidates, start=1):
+            title = (offer.get("position") or "").strip()
+            # Сбой на одной карточке не должен стоить остальных: запоминаем
+            # и идём дальше. Провал или нет — решаем в конце, когда видно,
+            # удалось ли хоть что-то.
+            try:
+                card = fetch_json(DETAIL_URL.format(offer_id=offer["id"]),
+                                  f"карточка {offer['id']}")
+            except QueryFailed as problem:
+                failed[str(offer["id"])] = str(problem)
+                print(f"  {number}/{len(candidates)} {title[:40]}: "
+                      f"карточка не получена — {problem}", flush=True)
+            else:
+                row = normalize(offer, card)
+                batch.append(row)
+                collected.append(row)
+                print(f"  {number}/{len(candidates)} {title[:40]}: "
+                      f"текст {len(row['description'] or '')} символов", flush=True)
 
-            if len(batch) == BATCH_SIZE:
-                save(batch, path)
-                batch = []
+                if len(batch) == BATCH_SIZE:
+                    save(batch, path)
+                    batch = []
 
-        time.sleep(PAUSE_SECONDS)
-
-    if batch:
-        save(batch, path)
+            time.sleep(PAUSE_SECONDS)
+    finally:
+        if batch:
+            save(batch, path)
 
     return collected, {"offers_total": len(offers),
                        "candidates": len(candidates),
