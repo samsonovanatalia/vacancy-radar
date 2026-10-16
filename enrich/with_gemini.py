@@ -39,7 +39,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import time
+from collections import deque
 from datetime import datetime, timezone
 
 import httpx
@@ -103,13 +105,36 @@ TEMPORARY_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 # Аргументом командной строки потолок можно опустить, но не поднять.
 MAX_PER_RUN = 100
 
-# Предохранитель: столько вакансий подряд со сбоем — и прогон останавливается.
-# Один-два сбоя — беда отдельной вакансии; пять подряд — почти наверняка
-# общая поломка: Gemini лежит, ключ отозван, пропала сеть. Без предохранителя
-# скрипт честно прошёл бы всех кандидатов с повторами — около 2,5 минуты на
-# каждого, при потолке 100 это больше четырёх часов. Разрозненные сбои не
-# копятся: любой успех обнуляет счёт.
-MAX_CONSECUTIVE_FAILURES = 5
+# Предохранитель: если среди последних BREAKER_WINDOW вакансий сбоем
+# завершились больше BREAKER_MAX_FAILURES — прогон останавливается. Без него
+# при общей поломке (Gemini лежит, ключ отозван, пропала сеть) скрипт честно
+# прошёл бы всех кандидатов с повторами — около 2,5 минуты на каждого, при
+# потолке 100 это больше четырёх часов.
+#
+# Доля за окно, а не серия подряд. До 2026-10-16 правило было «5 сбоев
+# подряд», и 13.10.2026 оно не сработало: Gemini отвечал 503 через раз, сбои
+# шли вперемешку с успехами, и любой успех обнулял счёт. Перегруженная
+# модель выглядит именно так — не стеной отказов, а их долей.
+#
+# Пока вакансий меньше окна, считаем по тем, что есть: шесть сбоев на
+# первых шести — тоже остановка.
+BREAKER_WINDOW = 10
+BREAKER_MAX_FAILURES = BREAKER_WINDOW // 2
+
+# Собственный дедлайн прогона в секундах — на 5 минут раньше таймаута шага
+# в collect.yml (timeout-minutes: 30). Меняешь одно — поменяй и другое.
+#
+# Зачем свой, если есть таймаут шага. Таймаут шага — внешний: GitHub убивает
+# процесс, finally не успевает, и пропадает неполная пачка ответов. Так
+# 13.10.2026 потерялись два готовых ответа. Свой дедлайн проверяется перед
+# каждой вакансией, и по нему скрипт выходит сам: дописывает пачку, печатает
+# итог.
+#
+# Почему 5 минут. Проверка стоит между вакансиями, поэтому начатая вакансия
+# доработает до конца. Худший случай: 3 попытки по REQUEST_TIMEOUT_MS (60 с)
+# плюс паузы 20 и 40 с и PAUSE_SECONDS — около 4 минут, и ещё секунды на
+# запись пачки. Пять минут это покрывают.
+RUN_DEADLINE_SECONDS = 25 * 60
 
 # Допустимые значения --source. Тот же список, что в accepted_values колонки
 # source в dbt_radar/models/staging/_staging.yml: появится источник — дописать
@@ -372,6 +397,29 @@ class RetriesExhausted(Exception):
 
 class DailyQuotaExhausted(Exception):
     """429 из-за суточной квоты модели. Останавливаем весь прогон."""
+
+
+class Terminated(BaseException):
+    """Процесс получил SIGTERM. Останавливаем прогон, готовое дописываем.
+
+    BaseException, а не Exception — как KeyboardInterrupt: сигнал может прийти
+    посреди запроса, внутри кода SDK или httpx, и чужой `except Exception`
+    там не должен его проглотить.
+    """
+
+
+def stop_on_sigterm(signum, frame) -> None:
+    """Обработчик SIGTERM: превращает сигнал в исключение Terminated.
+
+    По умолчанию SIGTERM завершает Python сразу, без finally. Исключение же
+    поднимается в том месте, где сейчас выполняется программа, и уходит
+    вверх, как любое другое: finally в enrich дописывает пачку.
+
+    Повторный SIGTERM, пока пачка пишется, игнорируем: иначе он прервал бы
+    саму запись.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise Terminated()
 
 
 def read_api_key() -> str:
@@ -763,7 +811,16 @@ def enrich(limit: int, source: str | None) -> None:
     rows: list[dict] = []           # ответы, ещё не записанные в BigQuery
     enriched = 0                    # сколько строк уже записано
     failed: dict[str, str] = {}     # vacancy_key → причина сбоя
-    failures_in_a_row = 0           # сбоев подряд; любой успех обнуляет
+    # Окно предохранителя: исходы последних BREAKER_WINDOW вакансий, True —
+    # сбой. deque с maxlen сам выбрасывает самый старый исход, когда
+    # приходит новый, а sum считает True за 1.
+    recent_failures: deque[bool] = deque(maxlen=BREAKER_WINDOW)
+    # monotonic, а не datetime.now: эти часы не прыгают, если системное
+    # время переведут посреди прогона.
+    deadline = time.monotonic() + RUN_DEADLINE_SECONDS
+    # signal.signal возвращает прежний обработчик — в finally вернём его на
+    # место: снаружи enrich (в тестах, например) SIGTERM работает как обычно.
+    previous_sigterm = signal.signal(signal.SIGTERM, stop_on_sigterm)
 
     # Сбой на одной вакансии не прерывает прогон: пишем его в лог и в failed
     # и идём к следующей. Сбоем вакансии считаем:
@@ -774,18 +831,30 @@ def enrich(limit: int, source: str | None) -> None:
     #   httpx.TransportError — прочие сетевые ошибки, их тоже не повторяли.
     # Незаписанная вакансия остаётся кандидатом: следующий прогон попробует снова.
     #
-    # Весь прогон останавливают две вещи:
+    # Весь прогон останавливают четыре вещи:
     #   DailyQuotaExhausted — суточная квота общая, и каждая следующая
     #     вакансия упрётся в неё же до завтра;
-    #   предохранитель — MAX_CONSECUTIVE_FAILURES сбоев подряд: сломано
-    #     что-то общее, и оставшиеся вакансии упадут так же.
+    #   предохранитель — больше половины сбоев за последние BREAKER_WINDOW
+    #     вакансий: сломано что-то общее, и оставшиеся вакансии упадут так же;
+    #   дедлайн — прошло RUN_DEADLINE_SECONDS, скоро GitHub убьёт шаг;
+    #   Terminated — пришёл SIGTERM: процесс просят завершиться.
     # Ошибки в нашем коде (KeyError, TypeError) сбоем вакансии не считаются
     # и роняют прогон: это баг, и его надо увидеть сразу.
     #
-    # finally дописывает неполную последнюю порцию даже при падении: иначе
-    # ошибка на 49-й вакансии выбросила бы 9 готовых ответов и потраченную квоту.
+    # finally дописывает неполную последнюю порцию при любом из этих выходов
+    # и при падении: иначе ошибка на 49-й вакансии выбросила бы 9 готовых
+    # ответов и потраченную квоту. Не поможет он только против SIGKILL —
+    # его перехватить нельзя; от него и страхует дедлайн.
     try:
         for number, vacancy in enumerate(candidates, start=1):
+            if time.monotonic() >= deadline:
+                print(
+                    f"прогон остановлен по дедлайну: прошло {RUN_DEADLINE_SECONDS // 60} "
+                    f"минут; не обработано вакансий: {len(candidates) - number + 1}.",
+                    flush=True,
+                )
+                break
+
             key = vacancy["vacancy_key"]
             progress = f"{number}/{len(candidates)} {key}"
             # Причина сбоя. Каждая ветка except только описывает сбой, а
@@ -803,7 +872,6 @@ def enrich(limit: int, source: str | None) -> None:
                 reason = f"сетевая ошибка {type(error).__name__}: {error}"
             else:
                 # else выполняется, только если в try не было исключения.
-                failures_in_a_row = 0
                 rows.append(to_row(key, answer))
                 print(f"{progress} ok", flush=True)
                 if len(rows) == BATCH_SIZE:
@@ -811,15 +879,16 @@ def enrich(limit: int, source: str | None) -> None:
                     enriched += len(rows)
                     rows = []
 
+            recent_failures.append(reason is not None)
             if reason is not None:
                 failed[key] = reason
-                failures_in_a_row += 1
                 print(f"{progress} пропущена: {reason}", flush=True)
-                if failures_in_a_row == MAX_CONSECUTIVE_FAILURES:
+                if sum(recent_failures) > BREAKER_MAX_FAILURES:
                     print(
-                        f"прогон остановлен досрочно: {MAX_CONSECUTIVE_FAILURES} вакансий "
-                        f"подряд завершились сбоем, последний — {reason}. Похоже, сломано "
-                        f"что-то общее; не обработано вакансий: {len(candidates) - number}.",
+                        f"прогон остановлен досрочно: из последних {len(recent_failures)} "
+                        f"вакансий сбоем завершились {sum(recent_failures)}, последний — "
+                        f"{reason}. Похоже, сломано что-то общее; не обработано вакансий: "
+                        f"{len(candidates) - number}.",
                         flush=True,
                     )
                     # break выходит из цикла; finally ниже всё равно сохранит
@@ -833,6 +902,12 @@ def enrich(limit: int, source: str | None) -> None:
             f"Суточная квота модели {MODEL_NAME} исчерпана, лимит: {quota}. "
             f"Продолжить можно завтра."
         ) from quota
+    except Terminated as stop:
+        # Код 1: прогон прерван снаружи и до конца не дошёл.
+        raise SystemExit(
+            "Прогон прерван сигналом SIGTERM. Готовые ответы дописаны; "
+            "необработанные вакансии останутся кандидатами на следующий прогон."
+        ) from stop
     finally:
         if rows:
             save(bq, table_id, rows)
@@ -845,11 +920,13 @@ def enrich(limit: int, source: str | None) -> None:
         )
         for failed_key, failed_reason in failed.items():
             print(f"  сбой: {failed_key} — {failed_reason}", flush=True)
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
     # Код 1 — только если кандидаты были, а не обогатилась ни одна: тогда
     # сломано что-то общее (ключ, модель, промпт), а не отдельная вакансия.
     # Частичный успех — код 0: шаг зелёный, а сбои видны в итоге выше.
-    # После досрочной остановки правило то же: обогатили хоть одну — код 0.
+    # После досрочной остановки — предохранителем или по дедлайну — правило
+    # то же: обогатили хоть одну — код 0.
     if candidates and not enriched:
         raise SystemExit(
             f"Не обогатилась ни одна вакансия из {len(candidates)}: "

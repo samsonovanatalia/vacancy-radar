@@ -1,11 +1,13 @@
-"""Проверки устойчивости enrich/with_gemini.py: повторы, пропуск сбоев, предохранитель.
+"""Проверки устойчивости enrich/with_gemini.py: повторы, пропуск сбоев,
+предохранитель, остановка по дедлайну и по SIGTERM.
 
 Ни Gemini, ни BigQuery тесты не вызывают. Запросы идут через настоящий SDK
 google-genai, но его HTTP-транспорт подменён на httpx.MockTransport: какой
 ответ вернуть (200, 504, 429, таймаут...), решает сценарий по заголовку
 вакансии. Так проверяется весь путь целиком: как SDK разбирает ошибку, как её
 видит наш код и сколько запросов насчитал хук-счётчик. Паузы подменены и
-по-настоящему не ждут, так что тесты идут секунды.
+по-настоящему не ждут, так что тесты идут секунды. Часы (time.monotonic)
+тоже поддельные: их двигают только подменённые паузы.
 
 Запуск из папки проекта:
     python -m unittest tests.test_with_gemini -v
@@ -20,6 +22,7 @@ import contextlib
 import io
 import json
 import os
+import signal
 import unittest
 from unittest import mock
 
@@ -59,6 +62,7 @@ SCENARIOS = {
     "timeout_once": ["read_timeout", "200"],
     "connect_always": ["connect_error"],
     "remote_protocol": ["remote_protocol"],
+    "sigterm": ["sigterm"],
 }
 
 
@@ -116,6 +120,12 @@ def respond(outcome: str, request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("[Errno 11001] getaddrinfo failed", request=request)
     if outcome == "remote_protocol":
         raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
+    if outcome == "sigterm":
+        # Сигнал посреди запроса к модели. Настоящий os.kill не годится: на
+        # Windows SIGTERM через os.kill сразу убивает процесс, вместе с
+        # тестами. Поэтому вызываем обработчик, который поставил enrich, —
+        # то же самое делает Python, когда сигнал приходит на самом деле.
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
     raise AssertionError(f"неизвестный исход {outcome}")
 
 
@@ -134,6 +144,7 @@ class EnrichResilienceTest(unittest.TestCase):
         self.requests_by_title: dict[str, int] = {}   # заголовок → сколько запросов ушло
         self.sleeps: list[float] = []                 # все паузы по порядку
         self.saved_keys: list[str] = []               # что «записано в BigQuery»
+        self.clock = 0.0                              # поддельное time.monotonic
         # patch подменяет объект на время теста, addCleanup возвращает на место,
         # даже если тест упал.
         for patcher in [
@@ -142,7 +153,8 @@ class EnrichResilienceTest(unittest.TestCase):
             mock.patch.object(eg.bigquery, "Client", lambda project: None),
             mock.patch.object(eg, "ensure_table", lambda bq, table_id: None),
             mock.patch.object(eg, "save", self.fake_save),
-            mock.patch.object(eg.time, "sleep", self.sleeps.append),
+            mock.patch.object(eg.time, "sleep", self.fake_sleep),
+            mock.patch.object(eg.time, "monotonic", lambda: self.clock),
         ]:
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -169,6 +181,11 @@ class EnrichResilienceTest(unittest.TestCase):
     def fake_save(self, bq, table_id, rows) -> None:
         self.saved_keys.extend(row["vacancy_key"] for row in rows)
 
+    def fake_sleep(self, seconds: float) -> None:
+        """Пауза не ждёт, а запоминается и сдвигает поддельные часы."""
+        self.sleeps.append(seconds)
+        self.clock += seconds
+
     def run_enrich(self, titles: list[str]) -> tuple[str, str | None]:
         """Прогоняет enrich по вакансиям с такими заголовками.
 
@@ -190,9 +207,11 @@ class EnrichResilienceTest(unittest.TestCase):
 
     def test_mixed_run(self) -> None:
         """Временные сбои повторяются, остальные пропускаются, прогон доходит до конца."""
-        titles = ["ok", "504_once", "504_always", "timeout_once", "connect_always",
-                  "502_html_once", "429_minute_once", "400", "403", "bad_json",
-                  "remote_protocol", "ok#2"]
+        # Сбои через один: в любом окне из 10 вакансий их ровно 5 — половина,
+        # не больше, и предохранитель не срабатывает.
+        titles = ["ok", "504_always", "504_once", "400", "timeout_once", "connect_always",
+                  "502_html_once", "403", "429_minute_once", "bad_json",
+                  "ok#2", "remote_protocol"]
         log, exit_message = self.run_enrich(titles)
 
         self.assertIsNone(exit_message, log)
@@ -208,14 +227,13 @@ class EnrichResilienceTest(unittest.TestCase):
         ])
         base = eg.RETRY_BASE_SECONDS
         retry_pauses = [seconds for seconds in self.sleeps if seconds != eg.PAUSE_SECONDS]
-        # 504_once: 20 | 504_always: 20, 40 | timeout_once: 20 | connect_always: 20, 40 |
+        # 504_always: 20, 40 | 504_once: 20 | timeout_once: 20 | connect_always: 20, 40 |
         # 502_html_once: 20 | 429_minute_once: большее из своей паузы и retryDelay 37 с.
-        self.assertEqual(retry_pauses, [base, base, 2 * base, base, base, 2 * base, base, max(base, 37)])
+        self.assertEqual(retry_pauses, [base, 2 * base, base, base, base, 2 * base, base, max(base, 37)])
         self.assertEqual(self.sleeps.count(eg.PAUSE_SECONDS), len(titles))
         self.assertIn("итог: обогащено 6, пропущено 6, запросов к модели 20", log)
         for title in ["504_always", "connect_always", "400", "403", "bad_json", "remote_protocol"]:
             self.assertIn(f"  сбой: test:{title} — ", log)
-        # Четыре сбоя подряд (400, 403, bad_json, remote_protocol) — меньше порога.
         self.assertNotIn("остановлен досрочно", log)
         self.assertNotIn("fake-key", log)
 
@@ -238,40 +256,80 @@ class EnrichResilienceTest(unittest.TestCase):
         self.assertNotIn("ok#3", self.requests_by_title)
         self.assertIn("итог: обогащено 2, пропущено 0, запросов к модели 3", log)
 
-    def test_breaker_stops_after_failures_in_a_row(self) -> None:
-        """MAX_CONSECUTIVE_FAILURES сбоев подряд — остановка; одну обогатили — код 0."""
-        limit = eg.MAX_CONSECUTIVE_FAILURES
-        failures = [f"400#{i}" for i in range(limit)]
-        log, exit_message = self.run_enrich(["ok", *failures, "ok#2"])
+    def test_breaker_stops_on_majority_not_in_a_row(self) -> None:
+        """Больше половины сбоев в окне — остановка, даже если успехи между ними.
 
-        self.assertIn("прогон остановлен досрочно", log)
+        Узор 13.10.2026: сбои вперемешку с успехами. Старое правило «5 подряд»
+        здесь не сработало бы ни разу — успех каждый раз обнулял счёт.
+        """
+        titles = ["400#1", "400#2", "ok", "400#3", "400#4", "ok#2",
+                  "400#5", "400#6", "ok#3"]
+        log, exit_message = self.run_enrich(titles)
+
+        # Шестой сбой — на 8-й вакансии: 6 из 8 больше половины окна.
+        self.assertIn("из последних 8 вакансий сбоем завершились 6", log)
         self.assertIn("не обработано вакансий: 1", log)
-        self.assertNotIn("ok#2", self.requests_by_title)
+        self.assertNotIn("ok#3", self.requests_by_title)
         self.assertIsNone(exit_message, log)
-        self.assertEqual(self.saved_keys, ["test:ok"])
-        self.assertIn(f"итог: обогащено 1, пропущено {limit}, запросов к модели {limit + 1}", log)
+        self.assertCountEqual(self.saved_keys, ["test:ok", "test:ok#2"])
+        self.assertIn("итог: обогащено 2, пропущено 6, запросов к модели 8", log)
 
     def test_breaker_with_nothing_enriched_exits_with_code_1(self) -> None:
         """Досрочная остановка без единого успеха — код 1, итог напечатан."""
-        limit = eg.MAX_CONSECUTIVE_FAILURES
-        log, exit_message = self.run_enrich([f"400#{i}" for i in range(limit + 1)])
+        stop_at = eg.BREAKER_MAX_FAILURES + 1
+        log, exit_message = self.run_enrich([f"400#{i}" for i in range(stop_at + 1)])
 
         self.assertIn("прогон остановлен досрочно", log)
-        self.assertEqual(len(self.requests_by_title), limit)
+        self.assertEqual(len(self.requests_by_title), stop_at)
         self.assertIsInstance(exit_message, str, log)
-        self.assertIn(f"итог: обогащено 0, пропущено {limit}, запросов к модели {limit}", log)
+        self.assertIn(f"итог: обогащено 0, пропущено {stop_at}, запросов к модели {stop_at}", log)
 
-    def test_success_resets_breaker(self) -> None:
-        """Разрозненные сбои не копятся: успех между ними обнуляет счёт."""
-        almost = eg.MAX_CONSECUTIVE_FAILURES - 1
-        titles = [*(f"400#a{i}" for i in range(almost)), "ok",
-                  *(f"400#b{i}" for i in range(almost)), "ok#2"]
+    def test_old_failures_leave_the_window(self) -> None:
+        """Сбои, выпавшие из окна, не считаются: половина — ещё не остановка."""
+        half = eg.BREAKER_MAX_FAILURES
+        # 5 сбоев, 10 успехов, снова 5 сбоев: к второй серии первая уже
+        # выпала из окна, и в нём всегда не больше 5 сбоев из 10.
+        titles = [*(f"400#a{i}" for i in range(half)),
+                  *(f"ok#{i}" for i in range(eg.BREAKER_WINDOW)),
+                  *(f"400#b{i}" for i in range(half))]
         log, exit_message = self.run_enrich(titles)
 
         self.assertNotIn("остановлен досрочно", log)
         self.assertEqual(len(self.requests_by_title), len(titles))
         self.assertIsNone(exit_message, log)
-        self.assertIn(f"итог: обогащено 2, пропущено {2 * almost}", log)
+        self.assertIn(f"итог: обогащено {eg.BREAKER_WINDOW}, пропущено {2 * half}", log)
+
+    def test_deadline_stops_run_and_saves_unfinished_batch(self) -> None:
+        """По дедлайну прогон выходит сам и дописывает неполную пачку.
+
+        Дедлайн — 12 поддельных секунд, каждая вакансия двигает часы на
+        PAUSE_SECONDS (5 с). Перед третьей часы показывают 10 — ещё можно,
+        перед четвёртой 15 — стоп. Три готовых ответа меньше BATCH_SIZE, то
+        есть лежат в незаписанной пачке: их должен дописать finally.
+        """
+        titles = [f"ok#{i}" for i in range(6)]
+        with mock.patch.object(eg, "RUN_DEADLINE_SECONDS", 12):
+            log, exit_message = self.run_enrich(titles)
+
+        self.assertIn("прогон остановлен по дедлайну", log)
+        self.assertIn("не обработано вакансий: 3", log)
+        self.assertEqual(self.saved_keys, ["test:ok#0", "test:ok#1", "test:ok#2"])
+        self.assertEqual(len(self.requests_by_title), 3)
+        self.assertIsNone(exit_message, log)
+        self.assertIn("итог: обогащено 3, пропущено 0, запросов к модели 3", log)
+
+    def test_sigterm_saves_unfinished_batch(self) -> None:
+        """SIGTERM посреди запроса: готовое дописано, итог напечатан, код 1."""
+        original = signal.getsignal(signal.SIGTERM)
+        log, exit_message = self.run_enrich(["ok", "504_once", "sigterm", "ok#2"])
+
+        self.assertIsInstance(exit_message, str, log)
+        self.assertIn("SIGTERM", exit_message)
+        self.assertEqual(self.saved_keys, ["test:ok", "test:504_once"])
+        self.assertNotIn("ok#2", self.requests_by_title)
+        self.assertIn("итог: обогащено 2, пропущено 0, запросов к модели 4", log)
+        # Обработчик вернулся на место: снаружи enrich SIGTERM работает как обычно.
+        self.assertIs(signal.getsignal(signal.SIGTERM), original)
 
 
 if __name__ == "__main__":
