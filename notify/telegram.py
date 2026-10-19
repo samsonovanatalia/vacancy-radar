@@ -22,6 +22,19 @@
   4. Печатает, когда истекает raw.digest_sent в песочнице BigQuery, и
      пересоздаёт её, если осталось меньше RENEW_BEFORE (см. keep_table_alive), —
      в любой день, даже когда очередь пуста или не доставлено ничего.
+  5. В конце любого запуска — и пустого, и упавшего — дописывает строку в
+     raw.digest_runs: когда, сколько доставлено, status (см.
+     sql/raw_digest_runs.sql).
+
+Один дайджест в день. Запуск приходит дважды: от внешнего триггера и от
+запасного расписания GitHub. Если сегодня (по Барселоне) уже был запуск со
+status sent или empty, следующий ничего не отправляет: пишет в
+raw.digest_runs строку skipped и выходит с кодом 0. Очередь не трогается —
+всё неотправленное уйдёт завтра. Упавший запуск (failed) второй не
+блокирует: ради этого запасной запуск и нужен. Обойти проверку — --force.
+
+В шапку дописывается строка о пропусках сбора и дайджеста за последние
+GAP_DAYS дней (mart_pipeline_days) — только если пропуски были.
 
 Почему лимит, а не вся очередь сразу: очередь копит вакансии за 30 дней, и
 сотня сообщений подряд — уже не подборка, а лента. Лимит откладывает, а не
@@ -56,6 +69,7 @@ status sql/raw_digest_sent.sql. Нет таблицы — скрипт упад�
     python -m notify.telegram 5                # пробный прогон: первые 5
     python -m notify.telegram --catch-up       # догоняющий: вся очередь целиком
     python -m notify.telegram 40 --catch-up    # догоняющий, но не больше 40
+    python -m notify.telegram --force          # даже если сегодня дайджест уже был
 """
 
 from __future__ import annotations
@@ -74,6 +88,16 @@ from google.cloud import bigquery
 MARTS_DATASET = "dbt_natalia_marts"
 RAW_DATASET = "raw"
 TABLE_NAME = "digest_sent"
+RUNS_TABLE_NAME = "digest_runs"
+
+# Исходы запуска, после которых сегодняшний дайджест считается состоявшимся.
+# failed сюда не входит: упавший запуск должен повторить следующий.
+DONE_STATUSES = ("sent", "empty")
+
+# За сколько последних дней показывать пропуски в шапке. Меньше окна
+# mart_pipeline_days (14 дней): пропуск двухнедельной давности, повторённый
+# в каждом дайджесте, — уже шум, а не новость. В логе dbt build он виден все 14.
+GAP_DAYS = 7
 
 # Сколько вакансий отправлять за обычный запуск. Это не дневная норма и не
 # «столько вакансий в день мне нужно»: в обычный день очередь короче сотни, и
@@ -180,6 +204,16 @@ TABLE_SCHEMA = [
     bigquery.SchemaField("status", "STRING"),
 ]
 
+# Та же схема, что в sql/raw_digest_runs.sql.
+RUNS_TABLE_SCHEMA = [
+    bigquery.SchemaField("run_at", "TIMESTAMP", mode="REQUIRED"),
+    bigquery.SchemaField("run_date", "DATE", mode="REQUIRED"),
+    bigquery.SchemaField("status", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("queue_size", "INTEGER"),
+    bigquery.SchemaField("sent_count", "INTEGER", mode="REQUIRED"),
+    bigquery.SchemaField("is_forced", "BOOLEAN", mode="REQUIRED"),
+]
+
 
 def read_args() -> argparse.Namespace:
     """Разбирает командную строку: необязательное число вакансий и флаг --catch-up."""
@@ -195,6 +229,12 @@ def read_args() -> argparse.Namespace:
     parser.add_argument(
         "--catch-up", action="store_true",
         help=f"догоняющий прогон: снять потолок {MAX_PER_RUN} и отправить всю очередь",
+    )
+    # Отдельный флаг, а не часть --catch-up: «отправить ещё раз сегодня» и
+    # «отправить всю очередь» — разные решения, и одно не должно тянуть другое.
+    parser.add_argument(
+        "--force", action="store_true",
+        help="отправить, даже если сегодня дайджест уже был",
     )
     args = parser.parse_args()
     # int("-3") разбирается без ошибки, поэтому ноль и минус ловим отдельно.
@@ -278,6 +318,38 @@ def fetch_queue(bq: bigquery.Client, project: str) -> list[dict]:
     return [dict(row) for row in bq.query(query).result()]
 
 
+def digest_done_today(bq: bigquery.Client, project: str, today: date) -> bool:
+    """True — сегодня уже был запуск со status из DONE_STATUSES."""
+    # День — параметром запроса, а не в f-строке: это значение, а не наша
+    # константа, и BigQuery сам приведёт его к типу DATE.
+    query = f"""
+        select count(*) as runs
+        from `{project}.{RAW_DATASET}.{RUNS_TABLE_NAME}`
+        where run_date = @today
+          and status in unnest(@done_statuses)
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("today", "DATE", today),
+        bigquery.ArrayQueryParameter("done_statuses", "STRING", list(DONE_STATUSES)),
+    ])
+    (row,) = bq.query(query, job_config=job_config).result()
+    return row["runs"] > 0
+
+
+def fetch_gaps(bq: bigquery.Client, project: str) -> list[dict]:
+    """Пропущенные дни за последние GAP_DAYS дней из mart_pipeline_days, по порядку."""
+    # Витрина — view: она считается при чтении, и пропуск виден, даже если
+    # сегодняшняя сборка dbt не прошла.
+    query = f"""
+        select run_date, is_collect_missing, is_digest_missing
+        from `{project}.{MARTS_DATASET}.mart_pipeline_days`
+        where run_date >= date_sub(current_date('Europe/Madrid'), interval {GAP_DAYS} day)
+          and (is_collect_missing or is_digest_missing)
+        order by run_date
+    """
+    return [dict(row) for row in bq.query(query).result()]
+
+
 def first_sentences(text: str, count: int) -> str:
     """Первые count предложений текста.
 
@@ -328,18 +400,35 @@ def format_language(code: str | None) -> str | None:
     return f"Объявление на {label}" if label else f"Объявление не на английском ({code})"
 
 
-def format_header(day: date, sending: int, in_queue: int) -> str:
+def format_gaps(gaps: list[dict]) -> str | None:
+    """«Пропуски за 7 дней: 12.10 — нет сбора; 14.10 — нет сбора и дайджеста»; None, если пропусков нет."""
+    if not gaps:
+        return None
+    parts = []
+    for gap in gaps:
+        missing = [name for name, flag in [("сбора", gap["is_collect_missing"]),
+                                           ("дайджеста", gap["is_digest_missing"])] if flag]
+        parts.append(f"{gap['run_date']:%d.%m} — нет {' и '.join(missing)}")
+    return f"Пропуски за {GAP_DAYS} дней: " + "; ".join(parts)
+
+
+def with_gaps(text: str, gaps_line: str | None) -> str:
+    """Дописывает строку о пропусках отдельной строкой; без пропусков текст не меняется."""
+    return text if gaps_line is None else f"{text}\n{gaps_line}"
+
+
+def format_header(day: date, sending: int, in_queue: int, gaps_line: str | None = None) -> str:
     """Шапка: «вакансий: 10» или, если очередь длиннее лимита, «вакансий: 25 из 64, остальные завтра»."""
     if sending == in_queue:
         count = f"{sending}"
     else:
         count = f"{sending} из {in_queue}, остальные завтра"
-    return f"<b>Дайджест за {day:%d.%m.%Y}</b>, вакансий: {count}"
+    return with_gaps(f"<b>Дайджест за {day:%d.%m.%Y}</b>, вакансий: {count}", gaps_line)
 
 
-def format_empty(day: date) -> str:
+def format_empty(day: date, gaps_line: str | None = None) -> str:
     """Единственное сообщение дня, когда очередь пуста."""
-    return f"<b>Дайджест за {day:%d.%m.%Y}</b>: сегодня новых вакансий нет"
+    return with_gaps(f"<b>Дайджест за {day:%d.%m.%Y}</b>: сегодня новых вакансий нет", gaps_line)
 
 
 def format_vacancy(vacancy: dict) -> str:
@@ -461,6 +550,23 @@ def save_status(bq: bigquery.Client, table_id: str, vacancy_key: str, status: st
     bq.load_table_from_json([row], table_id, job_config=job_config).result()
 
 
+def save_run(bq: bigquery.Client, project: str, today: date, run: dict) -> None:
+    """Дописывает в raw.digest_runs строку об этом запуске."""
+    # Тоже load job и тоже только дописываем (sql/raw_digest_runs.sql).
+    job_config = bigquery.LoadJobConfig(
+        schema=RUNS_TABLE_SCHEMA,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+    )
+    row = {
+        "run_at": datetime.now(timezone.utc).isoformat(),
+        "run_date": today.isoformat(),
+        **run,
+    }
+    table_id = f"{project}.{RAW_DATASET}.{RUNS_TABLE_NAME}"
+    bq.load_table_from_json([row], table_id, job_config=job_config).result()
+    print(f"{RAW_DATASET}.{RUNS_TABLE_NAME}: записан запуск, status {run['status']}", flush=True)
+
+
 def keep_table_alive(bq: bigquery.Client, table_id: str) -> None:
     """Печатает срок жизни raw.digest_sent; если осталось меньше RENEW_BEFORE — пересоздаёт её.
 
@@ -507,24 +613,59 @@ def keep_table_alive(bq: bigquery.Client, table_id: str) -> None:
           f"{table.expires:%Y-%m-%d %H:%M} UTC", flush=True)
 
 
-def send_digest(limit: int | None, catch_up: bool) -> None:
-    """Отправляет вакансии очереди, записывает исходы и печатает итог.
+def send_digest(limit: int | None, catch_up: bool, force: bool = False) -> None:
+    """Один запуск бота: проверка «сегодня уже был», отправка, строка в raw.digest_runs.
 
-    limit — число из командной строки или None; catch_up — флаг --catch-up.
-    Сколько отправить на самом деле, решает batch_limit.
+    limit — число из командной строки или None; catch_up — флаг --catch-up;
+    force — флаг --force. Сколько отправить на самом деле, решает batch_limit.
     """
     token = read_setting("TELEGRAM_BOT_TOKEN")
     chat_id = read_setting("TELEGRAM_CHAT_ID")
     project = os.environ["BQ_PROJECT"]        # упадёт с понятной ошибкой, если не задан
 
     bq = bigquery.Client(project=project)
+    today = datetime.now(TIMEZONE).date()
+
+    if force:
+        print("--force: проверку «сегодня дайджест уже был» пропускаем", flush=True)
+    elif digest_done_today(bq, project, today):
+        # Тихо — без сообщения в чат и с кодом 0: второй запуск за день —
+        # штатный случай (сработали и триггер, и запасное расписание), а не сбой.
+        print(f"дайджест за {today:%d.%m.%Y} уже был — выходим, очередь не трогаем", flush=True)
+        save_run(bq, project, today,
+                 {"status": "skipped", "queue_size": None, "sent_count": 0, "is_forced": False})
+        return
+
+    # Строка для raw.digest_runs. deliver заполняет её по ходу, а пишем её в
+    # finally — и после успеха, и после падения. Начальный status — failed:
+    # запуск, не дошедший до успеха, и есть неудачный.
+    run = {"status": "failed", "queue_size": None, "sent_count": 0, "is_forced": force}
+    try:
+        deliver(bq, project, token, chat_id, today, limit, catch_up, run)
+    finally:
+        save_run(bq, project, today, run)
+
+
+def deliver(
+    bq: bigquery.Client, project: str, token: str, chat_id: str, today: date,
+    limit: int | None, catch_up: bool, run: dict,
+) -> None:
+    """Отправляет вакансии очереди, записывает исходы и печатает итог.
+
+    В run по ходу проставляет queue_size, sent_count и status — то, что
+    send_digest запишет в raw.digest_runs.
+    """
     table_id = f"{project}.{RAW_DATASET}.{TABLE_NAME}"
     queue = fetch_queue(bq, project)
+    run["queue_size"] = len(queue)
     # Срез ничего не выбрасывает: хвост очереди сегодня просто не отправляется.
     # Строк о нём в raw.digest_sent нет, и в следующий раз fetch_queue вернёт
     # его снова. queue[:None] — вся очередь: срез без конца идёт до конца списка.
     batch = queue[:batch_limit(limit, catch_up)]
-    today = datetime.now(TIMEZONE).date()
+    # До первого сообщения: не прочиталась витрина — падаем, ничего не отправив.
+    gaps_line = format_gaps(fetch_gaps(bq, project))
+    if gaps_line:
+        print(gaps_line, flush=True)
 
     if not catch_up and limit is not None and limit > MAX_PER_RUN:
         # Молча урезать нельзя: человек попросил 40, получил 25 и не понял бы почему.
@@ -548,9 +689,10 @@ def send_digest(limit: int | None, catch_up: bool) -> None:
         timeout=REQUEST_TIMEOUT_SECONDS,
     ) as client:
         if not queue:
-            _, problem = send_message(client, chat_id, format_empty(today))
+            _, problem = send_message(client, chat_id, format_empty(today, gaps_line))
             if problem is not None:
                 raise SystemExit(f"Очередь пуста, и сообщение об этом не ушло: {problem}")
+            run["status"] = "empty"
             print("итог: очередь пуста, отправлено сообщение «сегодня новых вакансий нет»", flush=True)
             # Записей сегодня нет, а следить за сроком всё равно нужно:
             # иначе несколько тихих недель подряд — и таблицу удалят.
@@ -559,7 +701,8 @@ def send_digest(limit: int | None, catch_up: bool) -> None:
 
         # Шапка — такое же сообщение, как остальные: не ушла — пишем в лог
         # и отправляем вакансии дальше.
-        _, header_problem = send_message(client, chat_id, format_header(today, len(batch), len(queue)))
+        _, header_problem = send_message(client, chat_id,
+                                         format_header(today, len(batch), len(queue), gaps_line))
         header_status = "доставлена" if header_problem is None else "не доставлена"
         print(f"шапка {header_status}" + (f": {header_problem}" if header_problem else ""), flush=True)
         time.sleep(PAUSE_SECONDS)
@@ -614,6 +757,12 @@ def send_digest(limit: int | None, catch_up: bool) -> None:
                 # «кроме последнего» — лишняя ветка ради полутора секунд.
                 time.sleep(PAUSE_SECONDS)
         finally:
+            # sent, если дошла хоть одна вакансия, — даже когда прогон упал на
+            # середине. Иначе запасной запуск счёл бы день несостоявшимся и
+            # прислал второй дайджест; недошедшее и так уйдёт завтра.
+            run["sent_count"] = delivered
+            if delivered:
+                run["status"] = "sent"
             # Осталось в очереди всё, у чего нет записи: хвост за лимитом и сбои.
             remaining = len(queue) - delivered - len(undeliverable)
             print(
@@ -646,4 +795,4 @@ def send_digest(limit: int | None, catch_up: bool) -> None:
 
 if __name__ == "__main__":
     args = read_args()
-    send_digest(args.limit, args.catch_up)
+    send_digest(args.limit, args.catch_up, args.force)

@@ -123,6 +123,9 @@ class SendDigestTest(unittest.TestCase):
         self.sleeps: list[float] = []
         self.saved: list[tuple[str, str]] = []          # что «записано в raw.digest_sent»: (ключ, status)
         self.kept_alive: list[str] = []                 # таблицы, у которых проверяли срок жизни
+        self.runs: list[dict] = []                      # что «записано в raw.digest_runs»
+        self.done_today = False                         # ответ digest_done_today
+        self.gaps: list[dict] = []                      # ответ fetch_gaps
         for patcher in [
             mock.patch.dict(os.environ, {
                 "BQ_PROJECT": "fake-project",
@@ -136,6 +139,12 @@ class SendDigestTest(unittest.TestCase):
             mock.patch.object(tg, "keep_table_alive",
                               lambda bq, table_id: self.kept_alive.append(table_id)),
             mock.patch.object(tg.time, "sleep", self.sleeps.append),
+            # dict(run) — копия: send_digest меняет словарь и после записи не трогает,
+            # но тест должен видеть то, что было на момент записи.
+            mock.patch.object(tg, "save_run",
+                              lambda bq, project, today, run: self.runs.append(dict(run))),
+            mock.patch.object(tg, "digest_done_today", lambda bq, project, today: self.done_today),
+            mock.patch.object(tg, "fetch_gaps", lambda bq, project: self.gaps),
         ]:
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -163,11 +172,11 @@ class SendDigestTest(unittest.TestCase):
         return respond(outcomes[min(attempt, len(outcomes) - 1)])
 
     def run_send(
-        self, queue: list[dict], limit: int | None = None, catch_up: bool = False
+        self, queue: list[dict], limit: int | None = None, catch_up: bool = False, force: bool = False
     ) -> tuple[str, str | None]:
         """Один запуск бота. Возвращает лог и сообщение SystemExit (None — код 0).
 
-        limit и catch_up — то, что пришло бы из командной строки.
+        limit, catch_up и force — то, что пришло бы из командной строки.
         fetch_queue отдаёт очередь без вакансий, уже записанных в self.saved.
         """
         recorded = {key for key, _ in self.saved}
@@ -176,7 +185,7 @@ class SendDigestTest(unittest.TestCase):
         with mock.patch.object(tg, "fetch_queue", lambda bq, project: remaining), \
                 contextlib.redirect_stdout(log):
             try:
-                tg.send_digest(limit, catch_up)
+                tg.send_digest(limit, catch_up, force)
             except SystemExit as stop:
                 return log.getvalue(), stop.code
         return log.getvalue(), None
@@ -419,16 +428,18 @@ class SendDigestTest(unittest.TestCase):
     def test_read_args(self) -> None:
         """Командная строка: число, флаг --catch-up в любом порядке; ноль — ошибка."""
         cases = [
-            ([], None, False),
-            (["5"], 5, False),
-            (["--catch-up"], None, True),
-            (["40", "--catch-up"], 40, True),
-            (["--catch-up", "40"], 40, True),
+            ([], None, False, False),
+            (["5"], 5, False, False),
+            (["--catch-up"], None, True, False),
+            (["40", "--catch-up"], 40, True, False),
+            (["--catch-up", "40"], 40, True, False),
+            (["--force"], None, False, True),
+            (["5", "--force"], 5, False, True),
         ]
-        for argv, limit, catch_up in cases:
+        for argv, limit, catch_up, force in cases:
             with self.subTest(argv=argv), mock.patch.object(sys, "argv", ["notify.telegram", *argv]):
                 args = tg.read_args()
-                self.assertEqual((args.limit, args.catch_up), (limit, catch_up))
+                self.assertEqual((args.limit, args.catch_up, args.force), (limit, catch_up, force))
         # parser.error печатает подсказку в stderr и выходит — прячем её из вывода тестов.
         with mock.patch.object(sys, "argv", ["notify.telegram", "0"]), \
                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -478,6 +489,143 @@ class SendDigestTest(unittest.TestCase):
         _, exit_message = self.run_send([make_vacancy("403")])
         self.assertIsInstance(exit_message, str)
         self.assertEqual(self.kept_alive, [table_id] * 3)
+
+    # --- raw.digest_runs ---
+
+    def test_run_recorded_for_every_outcome(self) -> None:
+        """Строка о запуске пишется всегда: доставлено, очередь пуста, не доставлено ничего."""
+        self.run_send([make_vacancy("ok"), make_vacancy("502_always")])   # одна дошла, одна нет
+        self.run_send([])                                                 # очередь пуста
+        self.run_send([make_vacancy("403")])                              # не дошло ничего
+        self.header_outcomes = ["403"]
+        self.run_send([])                                                 # пусто, и сообщение не ушло
+
+        self.assertEqual(self.runs, [
+            {"status": "sent", "queue_size": 2, "sent_count": 1, "is_forced": False},
+            {"status": "empty", "queue_size": 0, "sent_count": 0, "is_forced": False},
+            {"status": "failed", "queue_size": 1, "sent_count": 0, "is_forced": False},
+            {"status": "failed", "queue_size": 0, "sent_count": 0, "is_forced": False},
+        ])
+
+    def test_run_recorded_when_crashed(self) -> None:
+        """Запуск упал на записи исхода — строка о запуске всё равно записана, status failed."""
+        def broken_save(bq, table_id, key, status):
+            raise RuntimeError("BigQuery недоступен")
+
+        with mock.patch.object(tg, "save_status", broken_save), \
+                self.assertRaisesRegex(RuntimeError, "BigQuery недоступен"):
+            self.run_send([make_vacancy("ok")])
+        self.assertEqual(self.runs, [{"status": "failed", "queue_size": 1, "sent_count": 0, "is_forced": False}])
+
+    def test_crash_after_delivery_counts_as_sent(self) -> None:
+        """Первая дошла, на второй запуск упал — status sent: второй дайджест сегодня не нужен."""
+        calls = []
+
+        def save_once(bq, table_id, key, status):
+            calls.append(key)
+            if len(calls) > 1:
+                raise RuntimeError("BigQuery недоступен")
+
+        with mock.patch.object(tg, "save_status", save_once), self.assertRaises(RuntimeError):
+            self.run_send([make_vacancy("ok"), make_vacancy("ok#2")])
+        self.assertEqual(self.runs, [{"status": "sent", "queue_size": 2, "sent_count": 1, "is_forced": False}])
+
+    # --- один дайджест в день ---
+
+    def test_second_run_today_is_skipped(self) -> None:
+        """Сегодня дайджест уже был: ничего не отправляем, не записываем исходов, код 0, строка skipped."""
+        self.done_today = True
+        log, exit_message = self.run_send([make_vacancy("ok")])
+
+        self.assertIsNone(exit_message, log)
+        self.assertEqual(self.payloads, [])
+        # Очередь не тронута: исходов нет, завтрашний запуск возьмёт её целиком.
+        self.assertEqual(self.saved, [])
+        self.assertEqual(self.runs, [{"status": "skipped", "queue_size": None, "sent_count": 0, "is_forced": False}])
+        self.assertIn("уже был — выходим, очередь не трогаем", log)
+
+    def test_force_sends_even_if_done_today(self) -> None:
+        """--force обходит проверку: отправка идёт, в строке запуска is_forced."""
+        self.done_today = True
+        log, exit_message = self.run_send([make_vacancy("ok")], force=True)
+
+        self.assertIsNone(exit_message, log)
+        self.assertEqual(self.saved, [("test:ok", "sent")])
+        self.assertEqual(self.runs, [{"status": "sent", "queue_size": 1, "sent_count": 1, "is_forced": True}])
+        self.assertIn("--force", log)
+
+    # --- пропуски в шапке ---
+
+    def test_gaps_line_in_header_and_empty_day(self) -> None:
+        """Пропуски есть — строка о них последней строкой шапки и сообщения пустого дня."""
+        self.gaps = [
+            {"run_date": tg.date(2026, 10, 12), "is_collect_missing": True, "is_digest_missing": True},
+            {"run_date": tg.date(2026, 10, 14), "is_collect_missing": False, "is_digest_missing": True},
+        ]
+        expected = "Пропуски за 7 дней: 12.10 — нет сбора и дайджеста; 14.10 — нет дайджеста"
+
+        self.run_send([make_vacancy("ok")])
+        self.run_send([])
+
+        header, _, empty = self.texts()
+        self.assertRegex(header, r"^<b>Дайджест за [\d.]+</b>, вакансий: 1\n" + expected + "$")
+        self.assertRegex(empty, r"^<b>Дайджест за [\d.]+</b>: сегодня новых вакансий нет\n" + expected + "$")
+
+    def test_no_gaps_no_line(self) -> None:
+        """Пропусков нет — шапка та же, что и раньше, без лишней строки."""
+        self.assertIsNone(tg.format_gaps([]))
+        self.assertEqual(tg.format_header(tg.date(2026, 10, 19), 3, 3), "<b>Дайджест за 19.10.2026</b>, вакансий: 3")
+        self.assertEqual(tg.format_empty(tg.date(2026, 10, 19)),
+                         "<b>Дайджест за 19.10.2026</b>: сегодня новых вакансий нет")
+
+
+class FakeRunsBigQuery:
+    """BigQuery для digest_done_today и save_run: запоминает запросы и загрузки."""
+
+    def __init__(self, runs_today: int = 0) -> None:
+        self.runs_today = runs_today
+        self.queries: list[tuple[str, object]] = []
+        self.loads: list[tuple[list[dict], str, object]] = []
+
+    def query(self, sql: str, job_config=None):
+        self.queries.append((sql, job_config))
+        return mock.Mock(result=lambda: [{"runs": self.runs_today}])
+
+    def load_table_from_json(self, rows, table_id, job_config=None):
+        self.loads.append((rows, table_id, job_config))
+        return mock.Mock()
+
+
+class DigestRunsTest(unittest.TestCase):
+
+    def test_done_today_counts_only_sent_and_empty(self) -> None:
+        """Запрос — к raw.digest_runs за сегодня, со статусами sent и empty; ответ — есть ли строки."""
+        today = tg.date(2026, 10, 19)
+        self.assertFalse(tg.digest_done_today(FakeRunsBigQuery(runs_today=0), "fake-project", today))
+
+        bq = FakeRunsBigQuery(runs_today=1)
+        self.assertTrue(tg.digest_done_today(bq, "fake-project", today))
+        ((sql, job_config),) = bq.queries
+        self.assertIn("from `fake-project.raw.digest_runs`", sql)
+        params = {param.name: param for param in job_config.query_parameters}
+        self.assertEqual(params["today"].value, today)
+        # failed и skipped не считаются: упавший запуск должен повторить следующий.
+        self.assertEqual(params["done_statuses"].values, ["sent", "empty"])
+
+    def test_save_run_row(self) -> None:
+        """Строка запуска: все колонки схемы, день по Барселоне строкой, загрузка в raw.digest_runs."""
+        bq = FakeRunsBigQuery()
+        with contextlib.redirect_stdout(io.StringIO()):
+            tg.save_run(bq, "fake-project", tg.date(2026, 10, 19),
+                        {"status": "empty", "queue_size": 0, "sent_count": 0, "is_forced": False})
+
+        ((rows, table_id, job_config),) = bq.loads
+        self.assertEqual(table_id, "fake-project.raw.digest_runs")
+        (row,) = rows
+        self.assertEqual(set(row), {field.name for field in tg.RUNS_TABLE_SCHEMA})
+        self.assertEqual(row["run_date"], "2026-10-19")
+        self.assertEqual(row["status"], "empty")
+        self.assertEqual(job_config.write_disposition, tg.bigquery.WriteDisposition.WRITE_APPEND)
 
 
 class FakeTable:

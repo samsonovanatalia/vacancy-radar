@@ -563,3 +563,132 @@ models:
           - not_null
       - name: relevance_score
         description: "Балл из mart_vacancies_scored. Чем больше, тем выше в подборке."
+
+  - name: mart_pipeline_days
+    description: >
+      Пропущенные дни конвейера: строка на каждый из 14 полных дней по
+      Барселоне (вчера и раньше) — сколько строк собрано, из скольких
+      источников, был ли дайджест. view, а не table: считается при чтении,
+      поэтому видна и когда сбор не запустился. Пропуски выводит в лог тест
+      tests/assert_no_missed_pipeline_days.sql, последние 7 дней — бот в шапке.
+    columns:
+      - name: run_date
+        description: "День по Барселоне (Europe/Madrid). Ключ витрины."
+        tests:
+          - not_null
+          - unique
+      - name: collected_rows
+        description: "Строк в raw arbeitnow, remoteok, adzuna, manfred с ingested_at в этот день."
+        tests:
+          - not_null
+      - name: sources_collected
+        description: "Из скольких активных источников (0–4) пришла хотя бы одна строка."
+        tests:
+          - not_null
+      - name: digest_basis
+        description: >
+          Какой таблицей решён is_digest_missing: digest_runs — день после
+          первой строки raw.digest_runs; digest_sent — день раньше неё,
+          переходный период до 03.11.2026.
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['digest_runs', 'digest_sent']
+      - name: vacancies_sent
+        description: >
+          Сколько вакансий ушло в этот день: sent_count успешных запусков из
+          raw.digest_runs, а в переходный период — строки raw.digest_sent.
+        tests:
+          - not_null
+      - name: is_collect_missing
+        description: "true — ни одной строки сбора ни из одного источника."
+        tests:
+          - not_null
+      - name: is_digest_missing
+        description: >
+          true — дайджеста не было: в raw.digest_runs нет запуска со status
+          sent или empty (в переходный период — нет строк в raw.digest_sent).
+          День с пустой очередью — запуск empty, пропуском не считается.
+        tests:
+          - not_null
+
+unit_tests:
+  # Проверка mart_pipeline_days на выдуманных строках: «сегодня» — 19.10.2026,
+  # окно — 05.10–18.10. В каждом дне свой случай, в комментарии — какой.
+  - name: test_mart_pipeline_days_finds_missed_days
+    model: mart_pipeline_days
+    overrides:
+      vars:
+        pipeline_today: "date '2026-10-19'"
+    given:
+      # Сбор есть каждый день, кроме 10.10. 18.10 по Барселоне — это 22:30 UTC
+      # 17.10: день считается по Europe/Madrid, а не по UTC. 19.10 — сегодня,
+      # в окно не входит.
+      - input: source('raw', 'arbeitnow')
+        rows:
+          - {ingested_at: "2026-10-05 08:00:00"}
+          - {ingested_at: "2026-10-06 08:00:00"}
+          - {ingested_at: "2026-10-07 08:00:00"}
+          - {ingested_at: "2026-10-08 08:00:00"}
+          - {ingested_at: "2026-10-09 08:00:00"}
+          - {ingested_at: "2026-10-11 08:00:00"}
+          - {ingested_at: "2026-10-12 08:00:00"}
+          - {ingested_at: "2026-10-13 08:00:00"}
+          - {ingested_at: "2026-10-14 08:00:00"}
+          - {ingested_at: "2026-10-15 08:00:00"}
+          - {ingested_at: "2026-10-16 08:00:00"}
+          - {ingested_at: "2026-10-17 22:30:00"}
+          - {ingested_at: "2026-10-19 08:00:00"}
+      # 17.10 собран только из remoteok — этого достаточно.
+      - input: source('raw', 'remoteok')
+        rows:
+          - {ingested_at: "2026-10-17 08:00:00"}
+      - input: source('raw', 'adzuna')
+        format: sql
+        rows: select cast(null as timestamp) as ingested_at from unnest([1]) where false
+      - input: source('raw', 'manfred')
+        format: sql
+        rows: select cast(null as timestamp) as ingested_at from unnest([1]) where false
+      # digest_runs ведётся с 15.10: дни раньше — по digest_sent.
+      #   15.10 — только failed: пропуск;
+      #   16.10 — empty, очередь была пуста: не пропуск;
+      #   17.10 — sent и потом skipped: не пропуск;
+      #   18.10 — только skipped: пропуск.
+      - input: source('raw', 'digest_runs')
+        rows:
+          - {run_date: "2026-10-15", status: failed, sent_count: 0}
+          - {run_date: "2026-10-16", status: empty, sent_count: 0}
+          - {run_date: "2026-10-17", status: sent, sent_count: 3}
+          - {run_date: "2026-10-17", status: skipped, sent_count: 0}
+          - {run_date: "2026-10-18", status: skipped, sent_count: 0}
+      # Переходный период: отправки каждый день до 15.10, кроме 08.10. Строка
+      # 18.10 не спасает этот день: он уже решается по digest_runs.
+      - input: source('raw', 'digest_sent')
+        rows:
+          - {sent_at: "2026-10-05 12:00:00"}
+          - {sent_at: "2026-10-06 12:00:00"}
+          - {sent_at: "2026-10-07 12:00:00"}
+          - {sent_at: "2026-10-09 12:00:00"}
+          - {sent_at: "2026-10-10 12:00:00"}
+          - {sent_at: "2026-10-11 12:00:00"}
+          - {sent_at: "2026-10-12 12:00:00"}
+          - {sent_at: "2026-10-13 12:00:00"}
+          - {sent_at: "2026-10-14 12:00:00"}
+          - {sent_at: "2026-10-18 12:00:00"}
+    expect:
+      rows:
+        - {run_date: "2026-10-05", digest_basis: digest_sent, is_collect_missing: false, is_digest_missing: false}
+        - {run_date: "2026-10-06", digest_basis: digest_sent, is_collect_missing: false, is_digest_missing: false}
+        - {run_date: "2026-10-07", digest_basis: digest_sent, is_collect_missing: false, is_digest_missing: false}
+        - {run_date: "2026-10-08", digest_basis: digest_sent, is_collect_missing: false, is_digest_missing: true}
+        - {run_date: "2026-10-09", digest_basis: digest_sent, is_collect_missing: false, is_digest_missing: false}
+        - {run_date: "2026-10-10", digest_basis: digest_sent, is_collect_missing: true, is_digest_missing: false}
+        - {run_date: "2026-10-11", digest_basis: digest_sent, is_collect_missing: false, is_digest_missing: false}
+        - {run_date: "2026-10-12", digest_basis: digest_sent, is_collect_missing: false, is_digest_missing: false}
+        - {run_date: "2026-10-13", digest_basis: digest_sent, is_collect_missing: false, is_digest_missing: false}
+        - {run_date: "2026-10-14", digest_basis: digest_sent, is_collect_missing: false, is_digest_missing: false}
+        - {run_date: "2026-10-15", digest_basis: digest_runs, is_collect_missing: false, is_digest_missing: true}
+        - {run_date: "2026-10-16", digest_basis: digest_runs, is_collect_missing: false, is_digest_missing: false}
+        - {run_date: "2026-10-17", digest_basis: digest_runs, is_collect_missing: false, is_digest_missing: false}
+        - {run_date: "2026-10-18", digest_basis: digest_runs, is_collect_missing: false, is_digest_missing: true}

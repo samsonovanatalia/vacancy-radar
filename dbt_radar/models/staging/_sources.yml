@@ -90,3 +90,26 @@ sources:
           # Свежесть не проверяем: колонки ingested_at нет, а пустая таблица —
           # нормальное состояние, пока бот не пишет в неё.
           freshness: null
+
+      - name: digest_runs
+        description: >
+          Журнал запусков дайджеста: одна строка = один запуск бота, в том
+          числе пустой (status empty), упавший (failed) и вышедший, потому что
+          сегодня дайджест уже был (skipped). Только дописывается, партиции по
+          run_date. Создаётся скриптом sql/raw_digest_runs.sql, пишет
+          notify/telegram.py, читает mart_pipeline_days.
+        config:
+          # Свежесть не проверяем: колонки ingested_at нет, а пропущенный день
+          # и так ловит mart_pipeline_days — с понятной причиной, а не «таблица
+          # старая».
+          freshness: null
+        columns:
+          - name: run_date
+            tests:
+              - not_null
+          - name: status
+            tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ['sent', 'empty', 'failed', 'skipped']

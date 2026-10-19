@@ -24,7 +24,7 @@ The interesting problems here were not "how do I call an API". They were: *this 
 
 ```mermaid
 flowchart LR
-    A1[Arbeitnow API] --> C[GitHub Actions<br/>06:00 UTC]
+    A1[Arbeitnow API] --> C[GitHub Actions<br/>06:17 UTC]
     A2[RemoteOK API] --> C
     A3[Adzuna API<br/>keyword × city] --> C
     A4[Manfred API<br/>list + card] --> C
@@ -36,7 +36,7 @@ flowchart LR
     R --> E[Gemini<br/>fact extraction]
     E --> R
     R --> M2[dbt marts<br/>digest queue · dashboard]
-    M2 --> T[Telegram bot<br/>08:00 UTC]
+    M2 --> T[Telegram bot<br/>08:09 UTC]
     M2 --> D[Looker Studio]
     T --> R
 ```
@@ -49,13 +49,13 @@ dbt runs three times per cycle, deliberately: the first pass decides who is a ca
 
 | Layer | Objects | Materialisation | Grain |
 |---|---|---|---|
-| `raw` | `arbeitnow`, `adzuna`, `remoteok`, `manfred`, `remotive`, `vacancy_pages`, `llm_enrichment`, `digest_sent` | tables, append-only | one row = one event as it happened — one fetch, one model answer, one delivery |
+| `raw` | `arbeitnow`, `adzuna`, `remoteok`, `manfred`, `remotive`, `vacancy_pages`, `llm_enrichment`, `digest_sent`, `digest_runs` | tables, append-only | one row = one event as it happened — one fetch, one model answer, one delivery, one bot run |
 | `staging` | `stg_vacancies`, `stg_manfred_facts`, `stg_vacancy_pages`, `stg_enrichment`, `stg_digest_sent` | views | one row = one vacancy, deduplicated, latest version wins |
-| `marts` | `mart_vacancies_scored`, `mart_enrichment_candidates`, `mart_vacancies_for_me`, `mart_digest_queue`, `mart_skill_demand`, `mart_salary`, `mart_salary_facts`, `mart_dashboard_kpi` | tables and views | scored vacancies, who the model may read, the shortlist, the send queue, weekly skill demand, salary facts and aggregates, one-row dashboard summary |
+| `marts` | `mart_vacancies_scored`, `mart_enrichment_candidates`, `mart_vacancies_for_me`, `mart_digest_queue`, `mart_skill_demand`, `mart_salary`, `mart_salary_facts`, `mart_dashboard_kpi`, `mart_pipeline_days` | tables and views | scored vacancies, who the model may read, the shortlist, the send queue, weekly skill demand, salary facts and aggregates, one-row dashboard summary, one row per day of pipeline health |
 
 The gap between the layers is the point: **30 613 rows in `raw` are 16 393 distinct postings.** The same vacancy is re-collected every morning it is still live, and raw keeps every collection as it happened. Deduplication belongs downstream, where it can be changed without losing history.
 
-**75 dbt data tests · 113 Python tests** with the network faked out, so failure modes — a 503, a timeout, an exhausted quota, a rejected message — are exercised without an outage.
+**88 dbt data tests · 1 dbt unit test · 127 Python tests** with the network faked out, so failure modes — a 503, a timeout, an exhausted quota, a rejected message — are exercised without an outage.
 
 Rules that appear twice tend to drift apart, so shared logic lives in macros (`clean_html_text`, `normalize_company_name`, `normalize_job_title`, `normalize_skill`, `normalize_city`) and the "who may be enriched" rule lives in a model, not in two Python scripts.
 
@@ -197,7 +197,11 @@ python -m notify.telegram                             # send
 python -m unittest discover -s tests -t .
 ```
 
-Schedules: `collect.yml` at 06:00 UTC, `digest.yml` at 08:00 UTC. Both accept a manual run. Per-run ceilings — 100 enrichments, 60 page fetches, 100 messages — are safety valves against a broken filter, and they defer rather than discard.
+Runs are started by an external trigger: cron-job.org calls GitHub's `workflow_dispatch` API. The GitHub schedules — `collect.yml` at 06:17 UTC, `digest.yml` at 08:09 UTC — stay as a fallback. Both workflows also accept a manual run; `digest.yml` has a `force` checkbox for a second send on the same day.
+
+**Why an external trigger, with GitHub's schedule kept as a fallback.** From 4 October GitHub began creating scheduled runs hours after their cron time — collect 4h17m to 7h47m late, digest up to 9h10m — while each job still started within seconds of its run being created. The delay is in the scheduler, not in the runner queue, and a public repository has no minutes quota to blame. Two cheap fixes were measured and failed: moving the crons off minute :00 (the busiest minute on GitHub) and pushing to `main` to mark the repository active. Over the next two days runs were still 4h00m–4h57m late, and the digest meant for 10:09 in Barcelona arrived at 14:07 and 14:34. So runs now start from cron-job.org, which calls the `workflow_dispatch` API; in the test run GitHub answered 204 and the run started within a minute. The GitHub schedule stays as a fallback: if the trigger fails, the run still comes, hours late, rather than not at all. That means most days each workflow runs twice, and the second run is designed to be harmless. Collection appends and staging deduplicates; enrichment skips postings already read by the current prompt. The digest writes one row per run to `raw.digest_runs` — empty and failed runs included — and exits quietly if a run today (Barcelona time) already delivered something or reported an empty queue. Nothing is dropped: whatever wasn't sent stays queued for tomorrow. A failed run does not count, so the fallback retries it. Missed days are tracked by `mart_pipeline_days`, a view over the last 14 days: a test warns in every dbt build, and the bot adds a line to the digest header — only on days when something was missed.
+
+Per-run ceilings — 100 enrichments, 60 page fetches, 100 messages — are safety valves against a broken filter, and they defer rather than discard.
 
 ---
 

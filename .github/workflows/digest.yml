@@ -32,8 +32,18 @@ on:
   # по местному; иначе он начнёт приходить в 09:09.
   schedule:
     - cron: "9 8 * * *"
-  # Запуск вручную кнопкой на вкладке Actions.
+  # Запуск вручную кнопкой на вкладке Actions — и от внешнего триггера
+  # (cron-job.org), который дёргает тот же workflow_dispatch через API.
+  #
+  # Дайджест — раз в день: если сегодня он уже был, бот выходит, ничего не
+  # отправив (notify/telegram.py, digest_done_today). Галочка force — для
+  # ручного повтора в тот же день; триггер её не ставит, по умолчанию false.
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Отправить, даже если сегодня дайджест уже был"
+        type: boolean
+        default: false
 
 jobs:
   digest:
@@ -66,15 +76,19 @@ jobs:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: printf '%s' "$GCP_SA_KEY" > key.json
 
-      # Без флагов: обычный прогон, не больше MAX_PER_RUN вакансий. --catch-up в
-      # расписание не ставим — догоняющий прогон разовый и запускается руками.
+      # Без числа и без --catch-up: обычный прогон, не больше MAX_PER_RUN
+      # вакансий. --catch-up в расписание не ставим — догоняющий прогон
+      # разовый и запускается руками. --force — только с галочкой force.
       #
       # timeout-minutes: обычный прогон — пара минут; 20 — запас на повторы при
       # 429 и 5xx. Прервётся по таймауту — вакансии не пропадут: исход записан
       # только у отправленных, остальные уйдут в следующий раз.
+      #
+      # inputs.force у запуска по расписанию пуст — тогда флага нет.
       - name: Отправить дайджест в Telegram
         timeout-minutes: 20
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python -m notify.telegram
+          FORCE_FLAG: ${{ inputs.force && '--force' || '' }}
+        run: python -m notify.telegram $FORCE_FLAG
